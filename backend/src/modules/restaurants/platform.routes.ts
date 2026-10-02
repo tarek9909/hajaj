@@ -1,7 +1,7 @@
 import { Router, type Request, type Response, type NextFunction } from 'express';
 import type { RowDataPacket, ResultSetHeader } from 'mysql2/promise';
 import { withTransaction, pool } from '../../infrastructure/database/pool.js';
-import { hashPassword } from '../../infrastructure/auth/passwords.js';
+import { insertRestaurantAdmin } from '../../infrastructure/email/accountLinks.js';
 import { createRestaurantSchema, updateRestaurantSchema, createAdministratorSchema } from '../../contracts/schemas.js';
 import { AppError } from '../../middleware/errorHandler.js';
 import { recordAuditEvent } from '../../infrastructure/logging/audit.js';
@@ -99,24 +99,16 @@ platformRouter.post('/restaurants', async (req: Request, res: Response, next: Ne
       const restaurantId = restRes.insertId;
 
       // 2. Insert Initial Restaurant Admin
-      const initialAdminPassword = body.initialAdmin.password || 'RestaurantAdmin123!';
-      const passwordHash = await hashPassword(initialAdminPassword);
       const emailNorm = body.initialAdmin.email.toLowerCase().trim();
-
-      const [adminRes] = await conn.execute<ResultSetHeader>(
-        `INSERT INTO admin_accounts 
-          (restaurant_id, account_kind, full_name, email_normalized, mobile, password_hash, password_setup_required, status, created_by)
-         VALUES (?, 'RESTAURANT_ADMIN', ?, ?, ?, ?, 0, 'ACTIVE', ?)`,
-        [
-          restaurantId,
-          body.initialAdmin.fullName,
-          emailNorm,
-          body.initialAdmin.mobile || null,
-          passwordHash,
-          actorId,
-        ]
-      );
-      const adminId = adminRes.insertId;
+      const admin = await insertRestaurantAdmin(conn, {
+        restaurantId,
+        fullName: body.initialAdmin.fullName,
+        email: emailNorm,
+        mobile: body.initialAdmin.mobile,
+        password: body.initialAdmin.password,
+        actorId,
+      });
+      const adminId = admin.adminId;
 
       // 3. Insert Initial Policy Version
       const pol = body.initialPolicy;
@@ -170,13 +162,14 @@ platformRouter.post('/restaurants', async (req: Request, res: Response, next: Ne
         conn
       );
 
-      return { restaurantId, adminId };
+      return { restaurantId, adminId, setupToken: admin.setupToken, setupPath: admin.setupPath };
     });
 
     res.status(201).json({
       data: {
         restaurantId: String(result.restaurantId),
         adminId: String(result.adminId),
+        ...(result.setupToken ? { setupToken: result.setupToken, setupPath: result.setupPath } : {}),
         message: 'Restaurant onboarded successfully with initial policy and administrator.',
       },
       meta: { requestId: req.requestId },
@@ -247,37 +240,47 @@ platformRouter.patch('/restaurants/:restaurantId', async (req: Request, res: Res
     const body = updateRestaurantSchema.parse(req.body);
     const actorId = req.sessionUser!.adminAccountId;
 
-    const [updateRes] = await pool.execute<ResultSetHeader>(
-      `UPDATE restaurants 
-       SET name = COALESCE(?, name),
-           contact_name = COALESCE(?, contact_name),
-           contact_mobile = COALESCE(?, contact_mobile),
-           contact_email = COALESCE(?, contact_email),
-           row_version = row_version + 1
-       WHERE id = ? AND row_version = ?`,
-      [
-        body.name || null,
-        body.contactName !== undefined ? body.contactName : null,
-        body.contactMobile !== undefined ? body.contactMobile : null,
-        body.contactEmail !== undefined ? body.contactEmail : null,
-        restaurantId,
-        body.expectedVersion,
-      ]
-    );
+    await withTransaction(async (conn) => {
+      const [updateRes] = await conn.execute<ResultSetHeader>(
+        `UPDATE restaurants
+         SET name = COALESCE(?, name),
+             contact_name = IF(?, ?, contact_name),
+             contact_mobile = IF(?, ?, contact_mobile),
+             contact_email = IF(?, ?, contact_email),
+             row_version = row_version + 1
+         WHERE id = ? AND row_version = ?`,
+        [
+          body.name || null,
+          body.contactName !== undefined ? 1 : 0,
+          body.contactName || null,
+          body.contactMobile !== undefined ? 1 : 0,
+          body.contactMobile || null,
+          body.contactEmail !== undefined ? 1 : 0,
+          body.contactEmail || null,
+          restaurantId,
+          body.expectedVersion,
+        ]
+      );
 
-    if (updateRes.affectedRows === 0) {
-      throw new AppError(412, 'ROW_VERSION_CONFLICT', 'Restaurant has been modified by another administrator');
-    }
+      if (updateRes.affectedRows === 0) {
+        const [exists] = await conn.execute<RowDataPacket[]>(`SELECT id FROM restaurants WHERE id = ?`, [restaurantId]);
+        if (!exists[0]) throw new AppError(404, 'RESTAURANT_NOT_FOUND', 'Restaurant not found');
+        throw new AppError(412, 'ROW_VERSION_CONFLICT', 'Restaurant has been modified by another administrator');
+      }
 
-    await recordAuditEvent({
-      restaurantId,
-      actorId,
-      actorKind: 'SUPERADMIN',
-      action: 'UPDATE_RESTAURANT',
-      entityType: 'RESTAURANT',
-      entityId: restaurantId,
-      requestId: req.requestId,
-      afterValues: body,
+      await recordAuditEvent(
+        {
+          restaurantId,
+          actorId,
+          actorKind: 'SUPERADMIN',
+          action: 'UPDATE_RESTAURANT',
+          entityType: 'RESTAURANT',
+          entityId: restaurantId,
+          requestId: req.requestId,
+          afterValues: body,
+        },
+        conn
+      );
     });
 
     res.json({
@@ -300,37 +303,43 @@ platformRouter.patch('/restaurants/:restaurantId/status', async (req: Request, r
 
     const actorId = req.sessionUser!.adminAccountId;
 
-    const [updateRes] = await pool.execute<ResultSetHeader>(
-      `UPDATE restaurants 
-       SET status = ?, row_version = row_version + 1 
-       WHERE id = ? AND row_version = ?`,
-      [status, restaurantId, expectedVersion]
-    );
-
-    if (updateRes.affectedRows === 0) {
-      throw new AppError(412, 'ROW_VERSION_CONFLICT', 'Restaurant has been modified by another administrator');
-    }
-
-    // If deactivated, revoke all active sessions for this restaurant's admins
-    if (status === 'INACTIVE') {
-      await pool.execute(
-        `UPDATE sessions s 
-         JOIN admin_accounts a ON a.id = s.admin_account_id 
-         SET s.revoked_at = NOW(3) 
-         WHERE a.restaurant_id = ? AND s.revoked_at IS NULL`,
-        [restaurantId]
+    await withTransaction(async (conn) => {
+      const [updateRes] = await conn.execute<ResultSetHeader>(
+        `UPDATE restaurants
+         SET status = ?, row_version = row_version + 1
+         WHERE id = ? AND row_version = ?`,
+        [status, restaurantId, expectedVersion]
       );
-    }
 
-    await recordAuditEvent({
-      restaurantId,
-      actorId,
-      actorKind: 'SUPERADMIN',
-      action: status === 'ACTIVE' ? 'ACTIVATE_RESTAURANT' : 'DEACTIVATE_RESTAURANT',
-      entityType: 'RESTAURANT',
-      entityId: restaurantId,
-      requestId: req.requestId,
-      afterValues: { status },
+      if (updateRes.affectedRows === 0) {
+        const [exists] = await conn.execute<RowDataPacket[]>(`SELECT id FROM restaurants WHERE id = ?`, [restaurantId]);
+        if (!exists[0]) throw new AppError(404, 'RESTAURANT_NOT_FOUND', 'Restaurant not found');
+        throw new AppError(412, 'ROW_VERSION_CONFLICT', 'Restaurant has been modified by another administrator');
+      }
+
+      if (status === 'INACTIVE') {
+        await conn.execute(
+          `UPDATE sessions s
+           JOIN admin_accounts a ON a.id = s.admin_account_id
+           SET s.revoked_at = NOW(3)
+           WHERE a.restaurant_id = ? AND s.revoked_at IS NULL`,
+          [restaurantId]
+        );
+      }
+
+      await recordAuditEvent(
+        {
+          restaurantId,
+          actorId,
+          actorKind: 'SUPERADMIN',
+          action: status === 'ACTIVE' ? 'ACTIVATE_RESTAURANT' : 'DEACTIVATE_RESTAURANT',
+          entityType: 'RESTAURANT',
+          entityId: restaurantId,
+          requestId: req.requestId,
+          afterValues: { status },
+        },
+        conn
+      );
     });
 
     res.json({
@@ -349,31 +358,46 @@ platformRouter.post('/restaurants/:restaurantId/administrators', async (req: Req
     const body = createAdministratorSchema.parse(req.body);
     const actorId = req.sessionUser!.adminAccountId;
 
-    const password = body.password || 'RestaurantAdmin123!';
-    const passwordHash = await hashPassword(password);
     const emailNorm = body.email.toLowerCase().trim();
 
-    const [adminRes] = await pool.execute<ResultSetHeader>(
-      `INSERT INTO admin_accounts 
-        (restaurant_id, account_kind, full_name, email_normalized, mobile, password_hash, password_setup_required, status, created_by)
-       VALUES (?, 'RESTAURANT_ADMIN', ?, ?, ?, ?, 0, 'ACTIVE', ?)`,
-      [restaurantId, body.fullName, emailNorm, body.mobile || null, passwordHash, actorId]
-    );
+    const result = await withTransaction(async (conn) => {
+      const [restRows] = await conn.execute<RowDataPacket[]>(`SELECT id FROM restaurants WHERE id = ? FOR UPDATE`, [
+        restaurantId,
+      ]);
+      if (!restRows[0]) {
+        throw new AppError(404, 'RESTAURANT_NOT_FOUND', 'Restaurant not found');
+      }
 
-    await recordAuditEvent({
-      restaurantId,
-      actorId,
-      actorKind: 'SUPERADMIN',
-      action: 'CREATE_RESTAURANT_ADMIN',
-      entityType: 'ADMIN_ACCOUNT',
-      entityId: String(adminRes.insertId),
-      requestId: req.requestId,
-      afterValues: { fullName: body.fullName, email: emailNorm },
+      const admin = await insertRestaurantAdmin(conn, {
+        restaurantId,
+        fullName: body.fullName,
+        email: emailNorm,
+        mobile: body.mobile,
+        password: body.password,
+        actorId,
+      });
+
+      await recordAuditEvent(
+        {
+          restaurantId,
+          actorId,
+          actorKind: 'SUPERADMIN',
+          action: 'CREATE_RESTAURANT_ADMIN',
+          entityType: 'ADMIN_ACCOUNT',
+          entityId: String(admin.adminId),
+          requestId: req.requestId,
+          afterValues: { fullName: body.fullName, email: emailNorm },
+        },
+        conn
+      );
+      return admin;
     });
 
     res.status(201).json({
       data: {
-        adminId: String(adminRes.insertId),
+        id: String(result.adminId),
+        adminId: String(result.adminId),
+        ...(result.setupToken ? { setupToken: result.setupToken, setupPath: result.setupPath } : {}),
         message: 'Administrator created successfully',
       },
       meta: { requestId: req.requestId },

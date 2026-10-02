@@ -1,7 +1,9 @@
+import { usePeriod } from '../context/PeriodContext';
+import { currentMonth } from '../lib/format';
 import React, { useState } from 'react';
 import { useParams } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { adjustmentsApi, configApi, employeesApi, platformApi } from '../lib/api';
+import { adjustmentsApi, configApi, employeesApi, restaurantApi } from '../lib/api';
 import {
   Plus,
   Ban,
@@ -11,10 +13,10 @@ import {
 } from 'lucide-react';
 
 export const AdjustmentsPage: React.FC = () => {
-  const { restaurantId = '1' } = useParams<{ restaurantId: string }>();
+  const { restaurantId = '' } = useParams<{ restaurantId: string }>();
   const queryClient = useQueryClient();
 
-  const [selectedMonth, setSelectedMonth] = useState('2026-09');
+  const { month: selectedMonth } = usePeriod();
   const [showAddModal, setShowAddModal] = useState(false);
   const [voidingAdj, setVoidingAdj] = useState<any | null>(null);
   const [voidReason, setVoidReason] = useState('');
@@ -23,7 +25,7 @@ export const AdjustmentsPage: React.FC = () => {
   // Form State
   const [formState, setFormState] = useState({
     employeeId: '',
-    payrollMonth: '2026-09-01',
+    payrollMonth: `${currentMonth()}-01`,
     workDate: '',
     category: 'DEDUCTION' as 'ADDITION' | 'DEDUCTION' | 'BASE_ADJUSTMENT',
     direction: 'DECREASE' as 'INCREASE' | 'DECREASE',
@@ -35,7 +37,7 @@ export const AdjustmentsPage: React.FC = () => {
 
   const { data: restaurant } = useQuery({
     queryKey: ['restaurant-info', restaurantId],
-    queryFn: () => platformApi.getRestaurant(restaurantId),
+    queryFn: () => restaurantApi.getProfile(restaurantId),
   });
 
   const { data: employees = [] } = useQuery({
@@ -114,24 +116,17 @@ export const AdjustmentsPage: React.FC = () => {
 
   return (
     <div>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '1.75rem', flexWrap: 'wrap', gap: '1rem' }}>
+      <div className="page-header">
         <div>
-          <h1 style={{ fontSize: '1.75rem', fontWeight: 700, letterSpacing: '-0.02em' }}>
-            Salary Adjustments & Deductions
+          <h1 className="page-title">
+            Adjustments
           </h1>
-          <p style={{ color: 'var(--text-muted)', fontSize: '0.875rem', marginTop: '0.25rem' }}>
+          <p className="page-subtitle">
             Discrete ledger adjustments: discretionary bonuses, custom deductions, and base revisions.
           </p>
         </div>
 
         <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center' }}>
-          <input
-            type="month"
-            className="input mono"
-            value={selectedMonth}
-            onChange={(e) => setSelectedMonth(e.target.value)}
-            style={{ width: 'auto', padding: '0.4rem 0.75rem' }}
-          />
           <button
             className="btn btn-primary"
             onClick={() => {
@@ -195,7 +190,7 @@ export const AdjustmentsPage: React.FC = () => {
                       </td>
                       <td>{adj.deductionTypeName || 'General'}</td>
                       <td>
-                        <span className="tabular-nums mono" style={{ fontWeight: 700, color: isPositive ? '#16a34a' : '#dc2626' }}>
+                        <span className="tabular-nums mono" style={{ fontWeight: 700, color: isPositive ? 'var(--status-success)' : 'var(--status-danger)' }}>
                           {isPositive ? '+' : '-'}
                           {adj.calculationMethod === 'FIXED'
                             ? `${currency} ${Number(adj.adjustmentValue).toFixed(decimals)}`
@@ -205,7 +200,7 @@ export const AdjustmentsPage: React.FC = () => {
                       <td style={{ fontSize: '0.8125rem', maxWidth: '280px' }}>
                         <div>{adj.reason}</div>
                         {adj.status === 'VOID' && (
-                          <div style={{ fontSize: '0.72rem', color: '#dc2626', marginTop: 4 }}>
+                          <div style={{ fontSize: '0.72rem', color: 'var(--status-danger)', marginTop: 4 }}>
                             Void reason: {adj.voidReason}
                           </div>
                         )}
@@ -219,7 +214,7 @@ export const AdjustmentsPage: React.FC = () => {
                         {adj.status === 'ACTIVE' && (
                           <button
                             className="btn btn-secondary btn-sm"
-                            style={{ color: '#dc2626' }}
+                            style={{ color: 'var(--status-danger)' }}
                             onClick={() => {
                               setModalError(null);
                               setVoidReason('');
@@ -258,7 +253,7 @@ export const AdjustmentsPage: React.FC = () => {
                   backgroundColor: 'var(--status-danger-bg)',
                   border: '1px solid var(--status-danger-border)',
                   borderRadius: 'var(--radius-md)',
-                  color: '#991b1b',
+                  color: 'var(--status-danger-text)',
                   fontSize: '0.8125rem',
                   marginBottom: '1rem',
                 }}
@@ -307,6 +302,20 @@ export const AdjustmentsPage: React.FC = () => {
                     </select>
                   </div>
 
+                  {formState.category === 'BASE_ADJUSTMENT' && (
+                    <div className="form-group">
+                      <label className="form-label">Direction</label>
+                      <select
+                        className="select"
+                        value={formState.direction}
+                        onChange={(e) => setFormState({ ...formState, direction: e.target.value as 'INCREASE' | 'DECREASE' })}
+                      >
+                        <option value="INCREASE">Increase</option>
+                        <option value="DECREASE">Decrease</option>
+                      </select>
+                    </div>
+                  )}
+
                   {formState.category === 'DEDUCTION' && (
                     <div className="form-group">
                       <label className="form-label">Deduction Type</label>
@@ -349,6 +358,7 @@ export const AdjustmentsPage: React.FC = () => {
                       className="input tabular-nums"
                       required
                       min={0.01}
+                      max={formState.calculationMethod === 'DAILY_PERCENTAGE' ? 100 : undefined}
                       placeholder={formState.calculationMethod === 'FIXED' ? '8.00' : '10'}
                       value={formState.adjustmentValue}
                       onChange={(e) => setFormState({ ...formState, adjustmentValue: e.target.value })}
@@ -400,7 +410,7 @@ export const AdjustmentsPage: React.FC = () => {
                   backgroundColor: 'var(--status-danger-bg)',
                   border: '1px solid var(--status-danger-border)',
                   borderRadius: 'var(--radius-md)',
-                  color: '#991b1b',
+                  color: 'var(--status-danger-text)',
                   fontSize: '0.8125rem',
                   marginBottom: '1rem',
                 }}

@@ -1,17 +1,133 @@
 import { Router, type Request, type Response, type NextFunction } from 'express';
-import type { RowDataPacket, ResultSetHeader } from 'mysql2/promise';
+import type { RowDataPacket } from 'mysql2/promise';
 import ExcelJS from 'exceljs';
 import { pool } from '../../infrastructure/database/pool.js';
 import { AppError } from '../../middleware/errorHandler.js';
+import { monthQuerySchema } from '../../contracts/schemas.js';
 
 export const reportRouter = Router({ mergeParams: true });
+
+/** Validates a YYYY-MM (or YYYY-MM-01) month; defaults to the current month. Throws a ZodError (422). */
+const parseMonth = (value: unknown): string =>
+  monthQuerySchema.parse(value === undefined || value === '' ? new Date().toISOString().slice(0, 7) : value);
+
+/** Formats a DATE column value (string or JS Date at UTC midnight) as YYYY-MM-DD. */
+const toYmd = (value: unknown): string | null => {
+  if (value === null || value === undefined) return null;
+  if (value instanceof Date) return value.toISOString().slice(0, 10);
+  return String(value).slice(0, 10);
+};
+
+const XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+
+/** Builds the payroll summary workbook with numeric cells and currency-aware number formats. */
+async function buildPayrollWorkbook(month: string, empRows: RowDataPacket[], currencyDecimals: number): Promise<Buffer> {
+  const moneyFmt = currencyDecimals > 0 ? `#,##0.${'0'.repeat(currencyDecimals)}` : '#,##0';
+  const hoursFmt = '0.00';
+  const workbook = new ExcelJS.Workbook();
+  workbook.creator = 'Restaurant Workforce Management Platform';
+  workbook.created = new Date();
+
+  const sheet = workbook.addWorksheet(`Payroll ${month}`);
+  sheet.columns = [
+    { header: 'Ref #', key: 'ref', width: 12 },
+    { header: 'Full Name', key: 'name', width: 25 },
+    { header: 'Position', key: 'pos', width: 18 },
+    { header: 'Base Salary', key: 'base', width: 14, style: { numFmt: moneyFmt } },
+    { header: 'Req Hours', key: 'req_hours', width: 12, style: { numFmt: hoursFmt } },
+    { header: 'Worked Hours', key: 'worked_hours', width: 14, style: { numFmt: hoursFmt } },
+    { header: 'Opening Debt (min)', key: 'open_debt', width: 18 },
+    { header: 'New Shortfall (min)', key: 'shortfall', width: 18 },
+    { header: 'Recovered (min)', key: 'recovered', width: 16 },
+    { header: 'Closing Debt (min)', key: 'close_debt', width: 18 },
+    { header: 'Overtime (min)', key: 'ot_min', width: 16 },
+    { header: 'Overtime Pay', key: 'ot_pay', width: 14, style: { numFmt: moneyFmt } },
+    { header: 'Late Incidents', key: 'late_inc', width: 14 },
+    { header: 'Late Deductions', key: 'late_ded', width: 16, style: { numFmt: moneyFmt } },
+    { header: 'Other Deductions', key: 'other_ded', width: 16, style: { numFmt: moneyFmt } },
+    { header: 'Net Salary', key: 'net', width: 16, style: { numFmt: moneyFmt } },
+    { header: 'Warnings', key: 'warn', width: 12 },
+  ];
+
+  const round = (v: unknown): number => {
+    const f = 10 ** currencyDecimals;
+    return Math.round(Number(v || 0) * f) / f;
+  };
+
+  for (const er of empRows) {
+    sheet.addRow({
+      ref: er.employee_number_snapshot,
+      name: er.full_name_snapshot,
+      pos: er.position_name_snapshot,
+      base: round(er.base_salary_due),
+      req_hours: Number(er.required_minutes) / 60,
+      worked_hours: Number(er.worked_minutes) / 60,
+      open_debt: Number(er.opening_debt_minutes),
+      shortfall: Number(er.new_shortfall_minutes),
+      recovered: Number(er.recovered_minutes),
+      close_debt: Number(er.closing_debt_minutes),
+      ot_min: Number(er.eligible_overtime_minutes),
+      ot_pay: round(er.overtime_amount),
+      late_inc: Number(er.late_incident_count),
+      late_ded: round(er.late_deduction_amount),
+      other_ded: round(er.other_deduction_amount),
+      net: round(er.net_salary),
+      warn: `${er.counted_warning_count}/${er.warning_threshold}`,
+    });
+  }
+
+  sheet.getRow(1).font = { bold: true };
+  sheet.getRow(1).fill = {
+    type: 'pattern',
+    pattern: 'solid',
+    fgColor: { argb: 'FFEFEFEF' },
+  };
+
+  return Buffer.from(await workbook.xlsx.writeBuffer());
+}
+
+/** Loads results for the period's active run and sends the xlsx download. */
+async function sendPayrollXlsx(restaurantId: string | number, month: string, res: Response): Promise<void> {
+  const [periodRows] = await pool.execute<RowDataPacket[]>(
+    `SELECT current_calculation_run_id, active_finalized_run_id, status
+     FROM payroll_periods WHERE restaurant_id = ? AND month_start = ?`,
+    [restaurantId, `${month}-01`]
+  );
+  const period = periodRows[0];
+  const runId = period?.active_finalized_run_id || period?.current_calculation_run_id;
+  if (!runId) {
+    throw new AppError(400, 'CALCULATION_REQUIRED', 'Please calculate payroll before generating exports');
+  }
+
+  const [empRows] = await pool.execute<RowDataPacket[]>(
+    `SELECT * FROM payroll_employee_results
+     WHERE restaurant_id = ? AND calculation_run_id = ?
+     ORDER BY full_name_snapshot ASC`,
+    [restaurantId, runId]
+  );
+  const [restRows] = await pool.execute<RowDataPacket[]>(
+    `SELECT currency_decimal_places FROM restaurants WHERE id = ?`,
+    [restaurantId]
+  );
+  const decimals = restRows[0] ? Number(restRows[0].currency_decimal_places) : 2;
+
+  const buffer = await buildPayrollWorkbook(month, empRows, decimals);
+  res.setHeader('Content-Type', XLSX_MIME);
+  res.setHeader('Content-Disposition', `attachment; filename="Payroll_Summary_${month}.xlsx"`);
+  res.send(buffer);
+}
 
 // GET /api/v1/restaurants/:restaurantId/reports/monthly?month=YYYY-MM
 reportRouter.get('/monthly', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const restaurantId = req.tenantContext!.restaurantId;
-    const month = (req.query.month as string) || new Date().toISOString().slice(0, 7);
+    const month = parseMonth(req.query.month);
     const monthStart = `${month}-01`;
+
+    if (req.query.format === 'xlsx') {
+      await sendPayrollXlsx(restaurantId, month, res);
+      return;
+    }
 
     // 1. Get period and active/current calculation run
     const [periodRows] = await pool.execute<RowDataPacket[]>(
@@ -55,68 +171,6 @@ reportRouter.get('/monthly', async (req: Request, res: Response, next: NextFunct
        ORDER BY full_name_snapshot ASC`,
       [restaurantId, runId]
     );
-
-    if (req.query.format === 'xlsx') {
-      const workbook = new ExcelJS.Workbook();
-      workbook.creator = 'Restaurant Workforce Management Platform';
-      workbook.created = new Date();
-
-      const sheet = workbook.addWorksheet(`Payroll ${month}`);
-      sheet.columns = [
-        { header: 'Ref #', key: 'ref', width: 12 },
-        { header: 'Full Name', key: 'name', width: 25 },
-        { header: 'Position', key: 'pos', width: 18 },
-        { header: 'Base Salary', key: 'base', width: 14 },
-        { header: 'Req Hours', key: 'req_hours', width: 12 },
-        { header: 'Worked Hours', key: 'worked_hours', width: 14 },
-        { header: 'Opening Debt (min)', key: 'open_debt', width: 18 },
-        { header: 'New Shortfall (min)', key: 'shortfall', width: 18 },
-        { header: 'Recovered (min)', key: 'recovered', width: 16 },
-        { header: 'Closing Debt (min)', key: 'close_debt', width: 18 },
-        { header: 'Overtime (min)', key: 'ot_min', width: 16 },
-        { header: 'Overtime Pay', key: 'ot_pay', width: 14 },
-        { header: 'Late Incidents', key: 'late_inc', width: 14 },
-        { header: 'Late Deductions', key: 'late_ded', width: 16 },
-        { header: 'Other Deductions', key: 'other_ded', width: 16 },
-        { header: 'Net Salary', key: 'net', width: 16 },
-        { header: 'Warnings', key: 'warn', width: 12 },
-      ];
-
-      for (const er of empRows) {
-        sheet.addRow({
-          ref: er.employee_number_snapshot,
-          name: er.full_name_snapshot,
-          pos: er.position_name_snapshot,
-          base: Number(er.base_salary_due).toFixed(2),
-          req_hours: (Number(er.required_minutes) / 60).toFixed(1),
-          worked_hours: (Number(er.worked_minutes) / 60).toFixed(1),
-          open_debt: er.opening_debt_minutes,
-          shortfall: er.new_shortfall_minutes,
-          recovered: er.recovered_minutes,
-          close_debt: er.closing_debt_minutes,
-          ot_min: er.eligible_overtime_minutes,
-          ot_pay: Number(er.overtime_amount).toFixed(2),
-          late_inc: er.late_incident_count,
-          late_ded: Number(er.late_deduction_amount).toFixed(2),
-          other_ded: Number(er.other_deduction_amount).toFixed(2),
-          net: Number(er.net_salary).toFixed(2),
-          warn: `${er.counted_warning_count}/${er.warning_threshold}`,
-        });
-      }
-
-      sheet.getRow(1).font = { bold: true };
-      sheet.getRow(1).fill = {
-        type: 'pattern',
-        pattern: 'solid',
-        fgColor: { argb: 'FFEFEFEF' },
-      };
-
-      const buffer = await workbook.xlsx.writeBuffer();
-      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-      res.setHeader('Content-Disposition', `attachment; filename="Payroll_Summary_${month}.xlsx"`);
-      res.send(Buffer.from(buffer));
-      return;
-    }
 
     // Compute overview totals
     const overview = {
@@ -209,7 +263,7 @@ reportRouter.get('/employees/:employeeId', async (req: Request, res: Response, n
   try {
     const restaurantId = req.tenantContext!.restaurantId;
     const employeeId = req.params.employeeId;
-    const month = (req.query.month as string) || new Date().toISOString().slice(0, 7);
+    const month = parseMonth(req.query.month);
     const monthStart = `${month}-01`;
 
     const [periodRows] = await pool.execute<RowDataPacket[]>(
@@ -355,7 +409,7 @@ reportRouter.get('/employees/:employeeId', async (req: Request, res: Response, n
 reportRouter.get('/debt', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const restaurantId = req.tenantContext!.restaurantId;
-    const month = (req.query.month as string) || new Date().toISOString().slice(0, 7);
+    const month = parseMonth(req.query.month);
     const monthStart = `${month}-01`;
 
     const [rows] = await pool.execute<RowDataPacket[]>(
@@ -369,7 +423,7 @@ reportRouter.get('/debt', async (req: Request, res: Response, next: NextFunction
         fullName: r.full_name_snapshot,
         debtSourceId: String(r.debt_source_id),
         sourceType: r.source_type,
-        originWorkDate: r.origin_work_date,
+        originWorkDate: toYmd(r.origin_work_date),
         openingMinutes: Number(r.opening_minutes),
         newMinutes: Number(r.new_minutes),
         waivedMinutes: Number(r.waived_minutes),
@@ -387,7 +441,7 @@ reportRouter.get('/debt', async (req: Request, res: Response, next: NextFunction
 reportRouter.get('/warnings', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const restaurantId = req.tenantContext!.restaurantId;
-    const month = (req.query.month as string) || new Date().toISOString().slice(0, 7);
+    const month = parseMonth(req.query.month);
     const monthStart = `${month}-01`;
 
     const [rows] = await pool.execute<RowDataPacket[]>(
@@ -421,94 +475,16 @@ reportRouter.get('/warnings', async (req: Request, res: Response, next: NextFunc
   }
 });
 
-// POST /api/v1/restaurants/:restaurantId/exports
-reportRouter.post('/exports', async (req: Request, res: Response, next: NextFunction) => {
+// POST /api/v1/restaurants/:restaurantId/exports (also reachable as /reports/exports)
+const handleExport = async (req: Request, res: Response, next: NextFunction) => {
   try {
     const restaurantId = req.tenantContext!.restaurantId;
-    const month = req.body.month || new Date().toISOString().slice(0, 7);
-    const monthStart = `${month}-01`;
-
-    const [periodRows] = await pool.execute<RowDataPacket[]>(
-      `SELECT current_calculation_run_id, active_finalized_run_id, status 
-       FROM payroll_periods WHERE restaurant_id = ? AND month_start = ?`,
-      [restaurantId, monthStart]
-    );
-    const period = periodRows[0];
-    const runId = period?.active_finalized_run_id || period?.current_calculation_run_id;
-
-    if (!runId) {
-      throw new AppError(400, 'CALCULATION_REQUIRED', 'Please calculate payroll before generating exports');
-    }
-
-    // Generate Excel directly with ExcelJS
-    const [empRows] = await pool.execute<RowDataPacket[]>(
-      `SELECT * FROM payroll_employee_results 
-       WHERE restaurant_id = ? AND calculation_run_id = ? 
-       ORDER BY full_name_snapshot ASC`,
-      [restaurantId, runId]
-    );
-
-    const workbook = new ExcelJS.Workbook();
-    workbook.creator = 'Restaurant Workforce Management Platform';
-    workbook.created = new Date();
-
-    const sheet = workbook.addWorksheet(`Payroll ${month}`);
-    sheet.columns = [
-      { header: 'Ref #', key: 'ref', width: 12 },
-      { header: 'Full Name', key: 'name', width: 25 },
-      { header: 'Position', key: 'pos', width: 18 },
-      { header: 'Base Salary', key: 'base', width: 14 },
-      { header: 'Req Hours', key: 'req_hours', width: 12 },
-      { header: 'Worked Hours', key: 'worked_hours', width: 14 },
-      { header: 'Opening Debt (min)', key: 'open_debt', width: 18 },
-      { header: 'New Shortfall (min)', key: 'shortfall', width: 18 },
-      { header: 'Recovered (min)', key: 'recovered', width: 16 },
-      { header: 'Closing Debt (min)', key: 'close_debt', width: 18 },
-      { header: 'Overtime (min)', key: 'ot_min', width: 16 },
-      { header: 'Overtime Pay', key: 'ot_pay', width: 14 },
-      { header: 'Late Incidents', key: 'late_inc', width: 14 },
-      { header: 'Late Deductions', key: 'late_ded', width: 16 },
-      { header: 'Other Deductions', key: 'other_ded', width: 16 },
-      { header: 'Net Salary', key: 'net', width: 16 },
-      { header: 'Warnings', key: 'warn', width: 12 },
-    ];
-
-    for (const er of empRows) {
-      sheet.addRow({
-        ref: er.employee_number_snapshot,
-        name: er.full_name_snapshot,
-        pos: er.position_name_snapshot,
-        base: Number(er.base_salary_due).toFixed(2),
-        req_hours: (Number(er.required_minutes) / 60).toFixed(1),
-        worked_hours: (Number(er.worked_minutes) / 60).toFixed(1),
-        open_debt: er.opening_debt_minutes,
-        shortfall: er.new_shortfall_minutes,
-        recovered: er.recovered_minutes,
-        close_debt: er.closing_debt_minutes,
-        ot_min: er.eligible_overtime_minutes,
-        ot_pay: Number(er.overtime_amount).toFixed(2),
-        late_inc: er.late_incident_count,
-        late_ded: Number(er.late_deduction_amount).toFixed(2),
-        other_ded: Number(er.other_deduction_amount).toFixed(2),
-        net: Number(er.net_salary).toFixed(2),
-        warn: `${er.counted_warning_count}/${er.warning_threshold}`,
-      });
-    }
-
-    // Format headers
-    sheet.getRow(1).font = { bold: true };
-    sheet.getRow(1).fill = {
-      type: 'pattern',
-      pattern: 'solid',
-      fgColor: { argb: 'FFEFEFEF' },
-    };
-
-    const buffer = await workbook.xlsx.writeBuffer();
-
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', `attachment; filename="Payroll_Summary_${month}.xlsx"`);
-    res.send(Buffer.from(buffer));
+    const month = parseMonth(req.body?.month);
+    await sendPayrollXlsx(restaurantId, month, res);
   } catch (err) {
     next(err);
   }
-});
+};
+
+reportRouter.post('/', handleExport);
+reportRouter.post('/exports', handleExport);

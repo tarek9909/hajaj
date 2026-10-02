@@ -9,8 +9,9 @@ import { pool } from './infrastructure/database/pool.js';
 // Routers
 import { authRouter } from './modules/auth/auth.routes.js';
 import { platformRouter } from './modules/restaurants/platform.routes.js';
+import { profileRouter } from './modules/restaurants/profile.routes.js';
 import { adminManagementRouter } from './modules/administrators/admin.routes.js';
-import { configurationRouter } from './modules/configuration/configuration.routes.js';
+import { configurationRouter, positionsRouter, deductionTypesRouter, shiftTemplatesRouter } from './modules/configuration/configuration.routes.js';
 import { employeeRouter } from './modules/employees/employee.routes.js';
 import { schedulingRouter } from './modules/scheduling/scheduling.routes.js';
 import { attendanceRouter } from './modules/attendance/attendance.routes.js';
@@ -22,14 +23,18 @@ import { reportRouter } from './modules/reports/report.routes.js';
 
 export function createApp(): Express {
   const app = express();
+  app.set('trust proxy', 1);
+
+  const allowedOrigins = (process.env.FRONTEND_ORIGIN || '')
+    .split(',')
+    .map((o) => o.trim())
+    .filter(Boolean);
+  const isDev = process.env.NODE_ENV !== 'production';
 
   app.use(cors({
     origin: (origin, callback) => {
-      if (!origin || origin.startsWith('http://localhost') || origin.startsWith('http://127.0.0.1')) {
-        callback(null, true);
-      } else {
-        callback(null, false);
-      }
+      const isLocal = !!origin && /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin);
+      callback(null, !origin || allowedOrigins.includes(origin) || (isDev && isLocal));
     },
     credentials: true,
   }));
@@ -63,26 +68,33 @@ export function createApp(): Express {
   const restaurantRouter = express.Router({ mergeParams: true });
   restaurantRouter.use(authenticateSession);
   restaurantRouter.use(resolveTenantContext);
-  restaurantRouter.use(handleIdempotency);
   restaurantRouter.use(requireCsrfProtection);
+  restaurantRouter.use(handleIdempotency);
 
+  restaurantRouter.use('/profile', profileRouter);
   restaurantRouter.use('/administrators', adminManagementRouter);
   restaurantRouter.use('/configuration', configurationRouter);
-  restaurantRouter.use('/positions', configurationRouter);
-  restaurantRouter.use('/deduction-types', configurationRouter);
-  restaurantRouter.use('/shift-templates', configurationRouter);
+  restaurantRouter.use('/positions', positionsRouter);
+  restaurantRouter.use('/deduction-types', deductionTypesRouter);
+  restaurantRouter.use('/shift-templates', shiftTemplatesRouter);
   restaurantRouter.use('/employees', employeeRouter);
   restaurantRouter.use('/schedules', schedulingRouter);
   restaurantRouter.use('/attendance', attendanceRouter);
   restaurantRouter.use('/warnings', warningRouter);
   restaurantRouter.use('/adjustments', adjustmentRouter);
   restaurantRouter.use('/debt', debtRouter);
-  restaurantRouter.use('/debt-waivers', debtRouter);
   restaurantRouter.use('/payroll', payrollRouter);
   restaurantRouter.use('/reports', reportRouter);
   restaurantRouter.use('/exports', reportRouter);
 
   app.use('/api/v1/restaurants/:restaurantId', restaurantRouter);
+
+  app.use((req, res) => {
+    res.status(404).json({
+      error: { code: 'NOT_FOUND', message: `No route for ${req.method} ${req.path}` },
+      meta: { requestId: req.requestId },
+    });
+  });
 
   // Centralized Error Handling
   app.use(errorHandler);

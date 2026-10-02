@@ -21,7 +21,8 @@ export class CalculationEngine {
     day: DailyCalculationInput,
     dailySalary: Decimal,
     lateGraceMinutes: number,
-    lateDeductionPercentage: number
+    lateDeductionPercentage: number,
+    decimalPlaces = 4
   ): DailyCalculationResult {
     let workedMinutes: number | null = null;
     let regularMinutes: number | null = null;
@@ -61,10 +62,19 @@ export class CalculationEngine {
     // Evaluate lateness across intervals
     for (let i = 0; i < day.actualIntervals.length; i++) {
       const act = day.actualIntervals[i]!;
-      const planned = day.plannedIntervals[i];
+      const planned = day.plannedIntervals.find((p) => p.sequenceNumber === act.sequenceNumber) ?? day.plannedIntervals[i];
       if (planned && act.checkInAt) {
         // Parse with setZone: true so the explicit offset/UTC in the ISO string is preserved
         const checkInDt = DateTime.fromISO(act.checkInAt, { setZone: true });
+        if (planned.startAt) {
+          // Absolute comparison: correct across midnight, DST and server timezone
+          const plannedAbs = DateTime.fromISO(planned.startAt, { setZone: true });
+          if (plannedAbs.isValid && checkInDt.isValid) {
+            const diff = Math.floor(checkInDt.diff(plannedAbs, 'minutes').minutes);
+            if (diff > maxLateMinutes) maxLateMinutes = diff;
+          }
+          continue;
+        }
         const [planHour, planMin] = planned.startLocalTime.split(':').map(Number);
         if (planHour !== undefined && planMin !== undefined) {
           const plannedDt = checkInDt.set({ hour: planHour, minute: planMin, second: 0, millisecond: 0 });
@@ -92,6 +102,7 @@ export class CalculationEngine {
           totalWorked += netDuration;
         }
       }
+      if (day.additionalWorkApproved === false) totalWorked = Math.min(totalWorked, day.requiredMinutes);
       workedMinutes = totalWorked;
       regularMinutes = Math.min(workedMinutes, day.requiredMinutes);
       shortfallMinutes = Math.max(0, day.requiredMinutes - workedMinutes);
@@ -104,7 +115,7 @@ export class CalculationEngine {
     }
 
     const lateDeductionAmount = qualifiesLateDeduction
-      ? dailySalary.times(lateDeductionPercentage).dividedBy(100).toNumber()
+      ? dailySalary.times(lateDeductionPercentage).dividedBy(100).toDecimalPlaces(decimalPlaces).toNumber()
       : 0;
 
     return {
@@ -188,7 +199,8 @@ export class CalculationEngine {
         day,
         dailyRateDec,
         policy.lateGraceMinutes,
-        policy.lateDeductionPercentage
+        policy.lateDeductionPercentage,
+        decimalPlaces
       );
 
       if (evalDay.isResolved && evalDay.dayType === 'WORK') {
@@ -320,7 +332,7 @@ export class CalculationEngine {
 
     // Days with 0 additional minutes
     for (const day of evaluatedDays) {
-      if ((day.additionalMinutes ?? 0) === 0) {
+      if (day.isResolved && (day.additionalMinutes ?? 0) === 0) {
         day.recoveredMinutes = 0;
         day.eligibleOvertimeMinutes = 0;
       }
@@ -355,12 +367,12 @@ export class CalculationEngine {
     let countedWarningCount = 0;
 
     for (const w of input.warnings) {
-      if (w.origin === 'AUTOMATIC_LATE') {
-        automaticWarningCount++;
-      } else {
-        customWarningCount++;
-      }
       if (w.systemQualifies && !w.adminVoided) {
+        if (w.origin === 'AUTOMATIC_LATE') {
+          automaticWarningCount++;
+        } else {
+          customWarningCount++;
+        }
         validWarningCount++;
         if (w.countsTowardLimit) {
           countedWarningCount++;
@@ -472,8 +484,14 @@ export class CalculationEngine {
       .plus(overtimeAmountDec)
       .plus(additionsDec)
       .minus(totalLateDeductions)
-      .minus(otherDeductionsDec)
-      .toDecimalPlaces(decimalPlaces);
+      .minus(otherDeductionsDec);
+
+    if (baseSalaryDueDec.isNegative()) {
+      blockers.push('Base salary after adjustments is negative');
+    }
+    if (netSalaryDec.isNegative()) {
+      blockers.push('Net salary is negative: deductions exceed earnings');
+    }
 
     const netSalary = netSalaryDec.toNumber();
 

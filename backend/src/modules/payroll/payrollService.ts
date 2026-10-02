@@ -1,6 +1,6 @@
 import crypto from 'crypto';
 import type { RowDataPacket, ResultSetHeader } from 'mysql2/promise';
-import { DateTime } from 'luxon';
+import { Decimal } from 'decimal.js';
 import { withTransaction, pool } from '../../infrastructure/database/pool.js';
 import { CalculationEngine } from '../../calculation-engine/engine.js';
 import type {
@@ -26,34 +26,22 @@ export class PayrollService {
     const monthStart = `${month}-01`;
 
     return await withTransaction(async (conn) => {
-      // 1. Lock the payroll period FOR UPDATE
+      // 1. Ensure the payroll period exists, then lock it
+      await conn.execute(
+        `INSERT IGNORE INTO payroll_periods (restaurant_id, month_start, status, source_revision)
+         VALUES (?, ?, 'DRAFT', 1)`,
+        [restaurantId, monthStart]
+      );
       const [periodRows] = await conn.execute<RowDataPacket[]>(
-        `SELECT id, status, source_revision, current_calculation_run_id, active_finalized_run_id 
-         FROM payroll_periods 
-         WHERE restaurant_id = ? AND month_start = ? 
+        `SELECT id, status, source_revision, current_calculation_run_id, active_finalized_run_id
+         FROM payroll_periods
+         WHERE restaurant_id = ? AND month_start = ?
          FOR UPDATE`,
         [restaurantId, monthStart]
       );
-
-      let payrollPeriodId: number;
-      let periodStatus: string;
-      let currentSourceRevision: number;
-
-      if (!periodRows[0]) {
-        // Create draft period if doesn't exist
-        const [pRes] = await conn.execute<ResultSetHeader>(
-          `INSERT INTO payroll_periods (restaurant_id, month_start, status, source_revision) 
-           VALUES (?, ?, 'DRAFT', 1)`,
-          [restaurantId, monthStart]
-        );
-        payrollPeriodId = pRes.insertId;
-        periodStatus = 'DRAFT';
-        currentSourceRevision = 1;
-      } else {
-        payrollPeriodId = Number(periodRows[0].id);
-        periodStatus = String(periodRows[0].status);
-        currentSourceRevision = Number(periodRows[0].source_revision);
-      }
+      const payrollPeriodId = Number(periodRows[0]!.id);
+      const periodStatus = String(periodRows[0]!.status);
+      const currentSourceRevision = Number(periodRows[0]!.source_revision);
 
       if (periodStatus === 'FINALIZED') {
         throw new AppError(409, 'PAYROLL_PERIOD_FINALIZED', 'Cannot recalculate a finalized month without reopening');
@@ -98,8 +86,9 @@ export class PayrollService {
         [restaurantId, monthStart]
       );
       const prevPeriod = prevPeriodRows[0];
-      const previousPayrollPeriodId = prevPeriod ? prevPeriod.id : null;
-      const previousFinalizedRunId = prevPeriod?.active_finalized_run_id || null;
+      const previousFinalizedRunId = prevPeriod?.active_finalized_run_id ? Number(prevPeriod.active_finalized_run_id) : null;
+      const previousPayrollPeriodId = previousFinalizedRunId ? Number(prevPeriod!.id) : null;
+      const previousNotFinalized = Boolean(prevPeriod) && !previousFinalizedRunId;
 
       // 5. Gather All Included Employees
       // Include active employees + inactive employees who worked in this month
@@ -110,8 +99,10 @@ export class PayrollService {
          FROM employees e
          JOIN positions p ON p.id = e.position_id
          LEFT JOIN schedule_days sd ON sd.employee_id = e.id AND sd.payroll_month = ?
-         WHERE e.restaurant_id = ? AND (e.status = 'ACTIVE' OR sd.id IS NOT NULL)`,
-        [monthStart, restaurantId]
+         WHERE e.restaurant_id = ? AND (e.status = 'ACTIVE' OR sd.id IS NOT NULL)
+           AND (e.employment_end_date IS NULL OR e.employment_end_date >= ?)
+           AND e.employment_start_date < DATE_ADD(?, INTERVAL 1 MONTH)`,
+        [monthStart, restaurantId, monthStart, monthStart]
       );
 
       // 6. Gather all schedule days and attendance for this month
@@ -146,14 +137,25 @@ export class PayrollService {
 
       // 7. Gather Debt Sources, Waivers, Warnings, Adjustments, Salaries
       const [debtSources] = await conn.execute<RowDataPacket[]>(
-        `SELECT s.id, s.employee_id, s.source_type, s.attendance_day_id, 
-                DATE_FORMAT(s.origin_work_date, '%Y-%m-%d') AS origin_work_date,
-                s.imported_minutes, d.shortfall_minutes
-         FROM hour_debt_sources s
-         LEFT JOIN payroll_daily_results d ON d.attendance_day_id = s.attendance_day_id
-         WHERE s.restaurant_id = ?`,
+        `SELECT id, employee_id, source_type, attendance_day_id,
+                DATE_FORMAT(origin_work_date, '%Y-%m-%d') AS origin_work_date,
+                DATE_FORMAT(opening_month, '%Y-%m-%d') AS opening_month,
+                imported_minutes
+         FROM hour_debt_sources
+         WHERE restaurant_id = ?`,
         [restaurantId]
       );
+      const debtSourceById = new Map(debtSources.map((s) => [String(s.id), s]));
+
+      // Debt carried in from earlier months is the closing balance of the previous finalized run
+      const [previousLots] = previousFinalizedRunId
+        ? await conn.execute<RowDataPacket[]>(
+            `SELECT employee_id, debt_source_id, closing_minutes
+             FROM debt_lot_results
+             WHERE restaurant_id = ? AND calculation_run_id = ?`,
+            [restaurantId, previousFinalizedRunId]
+          )
+        : [[] as RowDataPacket[]];
 
       const [waivers] = await conn.execute<RowDataPacket[]>(
         `SELECT id, employee_id, debt_source_id, minutes, status 
@@ -224,52 +226,95 @@ export class PayrollService {
         const dailyInputs: DailyCalculationInput[] = empDays.map((sd) => {
           const pl = plannedIntervals.filter((i) => String(i.schedule_day_id) === String(sd.schedule_day_id));
           const act = actualIntervals.filter((i) => String(i.attendance_day_id) === String(sd.attendance_day_id));
-          const isResolved = sd.dayType !== 'WORK' || sd.attendance_status === 'COMPLETED' || sd.attendance_status === 'CONFIRMED_ABSENT';
+          const status: string | null = sd.attendance_status ?? null;
+          // An excused attendance record removes the day's obligation
+          const dayType: 'WORK' | 'OFF' | 'EXCUSED' =
+            sd.day_type === 'WORK' && status === 'EXCUSED' ? 'EXCUSED' : sd.day_type;
+          const isResolved =
+            dayType !== 'WORK' || status === 'COMPLETED' || status === 'CONFIRMED_ABSENT';
 
           return {
             attendanceDayId: sd.attendance_day_id ? String(sd.attendance_day_id) : `synth-${sd.schedule_day_id}`,
             scheduleDayId: String(sd.schedule_day_id),
             workDate: sd.work_date,
-            dayType: sd.day_type,
-            requiredMinutes: Number(sd.required_minutes),
+            dayType,
+            requiredMinutes: dayType === 'WORK' ? Number(sd.required_minutes) : 0,
             isResolved,
-            attendanceStatus: sd.attendance_status || (sd.dayType === 'WORK' ? 'NOT_RECORDED' : 'OFF'),
-            plannedIntervals: pl.map((i) => ({
-              sequenceNumber: i.sequence_number,
-              startLocalTime: DateTime.fromJSDate(i.planned_start_at).toFormat('HH:mm:ss'),
-              endLocalTime: DateTime.fromJSDate(i.planned_end_at).toFormat('HH:mm:ss'),
-            })),
+            additionalWorkApproved: Boolean(sd.additional_work_approved),
+            attendanceStatus: (status ?? (dayType === 'WORK' ? 'NOT_RECORDED' : 'OFF')) as DailyCalculationInput['attendanceStatus'],
+            plannedIntervals: pl.map((i) => {
+              const startAt = new Date(i.planned_start_at);
+              const endAt = new Date(i.planned_end_at);
+              return {
+                sequenceNumber: i.sequence_number,
+                startLocalTime: startAt.toISOString().slice(11, 19),
+                endLocalTime: endAt.toISOString().slice(11, 19),
+                startAt: startAt.toISOString(),
+              };
+            }),
             actualIntervals: act.map((i) => ({
               sequenceNumber: i.sequence_number,
-              checkInAt: i.check_in_at ? DateTime.fromJSDate(i.check_in_at).toISO()! : '',
-              checkOutAt: i.check_out_at ? DateTime.fromJSDate(i.check_out_at).toISO()! : null,
+              checkInAt: i.check_in_at ? new Date(i.check_in_at).toISOString() : '',
+              checkOutAt: i.check_out_at ? new Date(i.check_out_at).toISOString() : null,
               unpaidBreakMinutes: Number(i.unpaid_break_minutes || 0),
             })),
           };
         });
 
         // Build DebtSourceInput (previous debt sources)
-        const empDebtSources: DebtSourceInput[] = debtSources
-          .filter((s) => String(s.employee_id) === empId && s.origin_work_date < monthStart)
-          .map((s) => ({
-            id: String(s.id),
-            sourceType: s.source_type,
-            attendanceDayId: s.attendance_day_id ? String(s.attendance_day_id) : null,
-            originWorkDate: s.origin_work_date,
-            minutes: Number(s.imported_minutes || s.shortfall_minutes || 0),
-            isOpening: true,
-          }));
+        const empDebtSources: DebtSourceInput[] = [];
+        const carriedIds = new Set<string>();
+        for (const lot of previousLots.filter((l) => String(l.employee_id) === empId)) {
+          const src = debtSourceById.get(String(lot.debt_source_id));
+          carriedIds.add(String(lot.debt_source_id));
+          const closing = Number(lot.closing_minutes);
+          if (src && closing > 0) {
+            empDebtSources.push({
+              id: String(src.id),
+              sourceType: src.source_type,
+              attendanceDayId: src.attendance_day_id ? String(src.attendance_day_id) : null,
+              originWorkDate: src.origin_work_date,
+              minutes: closing,
+              isOpening: true,
+            });
+          }
+        }
+        for (const src of debtSources) {
+          if (
+            String(src.employee_id) === empId &&
+            src.source_type === 'OPENING_IMPORT' &&
+            src.opening_month &&
+            src.opening_month <= monthStart &&
+            !carriedIds.has(String(src.id))
+          ) {
+            empDebtSources.push({
+              id: String(src.id),
+              sourceType: src.source_type,
+              attendanceDayId: null,
+              originWorkDate: src.origin_work_date,
+              minutes: Number(src.imported_minutes || 0),
+              isOpening: true,
+            });
+          }
+        }
 
         // Build Waivers
         const empWaivers: DebtWaiverInput[] = waivers
           .filter((w) => String(w.employee_id) === empId)
-          .map((w) => ({
+          .map((w) => {
+            // A waiver on this month's own shortfall targets the engine's per-day lot, not the stored source id
+            const src = debtSourceById.get(String(w.debt_source_id));
+            const originDay = src?.attendance_day_id
+              ? dailyInputs.find((d) => d.attendanceDayId === String(src.attendance_day_id))
+              : undefined;
+            return {
             id: String(w.id),
-            debtSourceId: String(w.debt_source_id),
+            debtSourceId: originDay ? `shortfall-${originDay.scheduleDayId}` : String(w.debt_source_id),
             effectiveMonth: monthStart,
             minutes: Number(w.minutes),
             status: w.status,
-          }));
+            };
+          });
 
         // Build Warnings
         const empWarnings: WarningInput[] = warnings
@@ -317,6 +362,8 @@ export class PayrollService {
         };
 
         const calc = CalculationEngine.calculateEmployeeMonth(empInput);
+        if (!empSalaryRecord) calc.blockers.push('No salary on file for this employee');
+        if (previousNotFinalized) calc.blockers.push('Previous month must be finalized before this month');
 
         // Insert into payroll_employee_results
         const [empResHeader] = await conn.execute<ResultSetHeader>(
@@ -421,38 +468,49 @@ export class PayrollService {
         }
 
         // Insert into debt_lot_results
-        const debtLotIdMap = new Map<string, number>();
         for (const lot of calc.debtLotResults) {
-          // If synthetic shortfall ID, resolve real debt source ID or ignore
-          const realDebtSourceId = lot.debtSourceId.startsWith('shortfall-')
-            ? (
-                debtSources.find(
-                  (s) => String(s.employee_id) === empId && s.origin_work_date === lot.originWorkDate
-                )?.id || null
-              )
-            : lot.debtSourceId;
-
-          if (realDebtSourceId) {
-            const [lotRes] = await conn.execute<ResultSetHeader>(
-              `INSERT INTO debt_lot_results 
-                (restaurant_id, calculation_run_id, employee_id, debt_source_id, source_snapshot,
-                 opening_minutes, new_minutes, waived_minutes, recovered_minutes, closing_minutes)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-              [
-                restaurantId,
-                calculationRunId,
-                empId,
-                realDebtSourceId,
-                JSON.stringify({ originWorkDate: lot.originWorkDate, sourceType: lot.sourceType }),
-                lot.openingMinutes,
-                lot.newMinutes,
-                lot.waivedMinutes,
-                lot.recoveredMinutes,
-                lot.closingMinutes,
-              ]
-            );
-            debtLotIdMap.set(String(realDebtSourceId), lotRes.insertId);
+          let realDebtSourceId: string | null = null;
+          if (lot.debtSourceId.startsWith('shortfall-')) {
+            const scheduleDayId = lot.debtSourceId.slice('shortfall-'.length);
+            const dayInput = dailyInputs.find((d) => d.scheduleDayId === scheduleDayId);
+            const attDayId = dayInput && !dayInput.attendanceDayId.startsWith('synth-') ? dayInput.attendanceDayId : null;
+            if (attDayId) {
+              // Debt sources are immutable facts; create the one this shortfall needs if attendance did not
+              await conn.execute(
+                `INSERT IGNORE INTO hour_debt_sources
+                  (restaurant_id, employee_id, source_type, attendance_day_id, origin_work_date)
+                 VALUES (?, ?, 'ATTENDANCE_SHORTFALL', ?, ?)`,
+                [restaurantId, empId, attDayId, lot.originWorkDate]
+              );
+              const [srcRows] = await conn.execute<RowDataPacket[]>(
+                `SELECT id FROM hour_debt_sources WHERE restaurant_id = ? AND attendance_day_id = ?`,
+                [restaurantId, attDayId]
+              );
+              realDebtSourceId = srcRows[0] ? String(srcRows[0].id) : null;
+            }
+          } else {
+            realDebtSourceId = lot.debtSourceId;
           }
+          if (!realDebtSourceId) continue;
+
+          await conn.execute(
+            `INSERT INTO debt_lot_results
+              (restaurant_id, calculation_run_id, employee_id, debt_source_id, source_snapshot,
+               opening_minutes, new_minutes, waived_minutes, recovered_minutes, closing_minutes)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+              restaurantId,
+              calculationRunId,
+              empId,
+              realDebtSourceId,
+              JSON.stringify({ originWorkDate: lot.originWorkDate, sourceType: lot.sourceType }),
+              lot.openingMinutes,
+              lot.newMinutes,
+              lot.waivedMinutes,
+              lot.recoveredMinutes,
+              lot.closingMinutes,
+            ]
+          );
         }
 
         // Insert into payroll_lines
@@ -471,15 +529,22 @@ export class PayrollService {
           ]
         );
 
-        // 2. Daily Overtime and Late Penalty lines
-        for (const day of calc.dailyResults) {
-          if (day.eligibleOvertimeMinutes !== null && day.eligibleOvertimeMinutes > 0) {
-            const dResultId = dailyResultIdMap.get(day.workDate)!;
-            const otHours = day.eligibleOvertimeMinutes / 60;
-            const otAmount = Number((otHours * calc.overtimeHourlyRate).toFixed(currencyDecimalPlaces));
-
+        // 2. Daily overtime lines: per-day amounts are allocated so they sum exactly to the monthly overtime
+        const otDays = calc.dailyResults.filter((d) => (d.eligibleOvertimeMinutes ?? 0) > 0);
+        if (otDays.length > 0) {
+          const amounts = otDays.map((d) =>
+            new Decimal(d.eligibleOvertimeMinutes!).dividedBy(60).times(calc.overtimeHourlyRate).toDecimalPlaces(currencyDecimalPlaces)
+          );
+          const diff = new Decimal(calc.overtimeAmount).minus(amounts.reduce((a, b) => a.plus(b), new Decimal(0)));
+          if (!diff.isZero()) {
+            let largest = 0;
+            amounts.forEach((a, i) => { if (a.greaterThan(amounts[largest]!)) largest = i; });
+            amounts[largest] = amounts[largest]!.plus(diff);
+          }
+          for (let i = 0; i < otDays.length; i++) {
+            const day = otDays[i]!;
             await conn.execute(
-              `INSERT INTO payroll_lines 
+              `INSERT INTO payroll_lines
                 (restaurant_id, calculation_run_id, employee_id, line_key, line_type, salary_adjustment_id, late_penalty_id, payroll_daily_result_id, description, quantity, unit, rate_snapshot, signed_amount, source_snapshot)
                VALUES (?, ?, ?, ?, 'OVERTIME', NULL, NULL, ?, ?, ?, 'HOUR', ?, ?, ?)`,
               [
@@ -487,102 +552,94 @@ export class PayrollService {
                 calculationRunId,
                 empId,
                 `OT_${day.workDate}`,
-                dResultId,
-                `Eligible Overtime (${day.eligibleOvertimeMinutes} mins) on ${day.workDate}`,
-                otHours,
+                dailyResultIdMap.get(day.workDate)!,
+                `Eligible overtime (${day.eligibleOvertimeMinutes} mins) on ${day.workDate}`,
+                new Decimal(day.eligibleOvertimeMinutes!).dividedBy(60).toNumber(),
                 calc.overtimeHourlyRate,
-                otAmount,
+                amounts[i]!.toNumber(),
                 JSON.stringify({ workDate: day.workDate, minutes: day.eligibleOvertimeMinutes }),
               ]
             );
           }
-
-          if (day.lateMinutes !== null && day.lateMinutes > policySnapshot.lateGraceMinutes && policySnapshot.lateDeductionPercentage > 0) {
-            const inputDay = dailyInputs.find((di) => di.workDate === day.workDate);
-            if (inputDay && inputDay.attendanceDayId && !inputDay.attendanceDayId.startsWith('synth-')) {
-              const attDayId = inputDay.attendanceDayId;
-              const penaltyDailyAmount = Number(
-                (calc.dailyRate * (policySnapshot.lateDeductionPercentage / 100)).toFixed(currencyDecimalPlaces)
-              );
-
-              await conn.execute(
-                `INSERT INTO late_penalties 
-                  (restaurant_id, employee_id, attendance_day_id, policy_version_id, salary_version_id, qualifies, late_minutes, daily_salary_basis, deduction_percentage, calculated_amount, source_attendance_version)
-                 VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, 1)
-                 ON DUPLICATE KEY UPDATE 
-                  qualifies = VALUES(qualifies),
-                  late_minutes = VALUES(late_minutes),
-                  daily_salary_basis = VALUES(daily_salary_basis),
-                  deduction_percentage = VALUES(deduction_percentage),
-                  calculated_amount = VALUES(calculated_amount)`,
-                [
-                  restaurantId,
-                  empId,
-                  attDayId,
-                  policyRecord.id,
-                  empSalaryRecord!.id,
-                  day.lateMinutes,
-                  calc.dailyRate,
-                  policySnapshot.lateDeductionPercentage,
-                  penaltyDailyAmount,
-                ]
-              );
-
-              const [penRows] = await conn.execute<RowDataPacket[]>(
-                `SELECT id FROM late_penalties WHERE restaurant_id = ? AND attendance_day_id = ?`,
-                [restaurantId, attDayId]
-              );
-              const penaltyId = penRows[0]?.id;
-
-              if (penaltyId) {
-                await conn.execute(
-                  `INSERT INTO payroll_lines 
-                    (restaurant_id, calculation_run_id, employee_id, line_key, line_type, salary_adjustment_id, late_penalty_id, payroll_daily_result_id, description, quantity, unit, rate_snapshot, signed_amount, source_snapshot)
-                   VALUES (?, ?, ?, ?, 'LATE_DEDUCTION', NULL, ?, NULL, ?, 1, 'DAY', ?, ?, ?)`,
-                  [
-                    restaurantId,
-                    calculationRunId,
-                    empId,
-                    `LATE_${day.workDate}`,
-                    penaltyId,
-                    `Late arrival penalty (${day.lateMinutes} mins) on ${day.workDate}`,
-                    penaltyDailyAmount,
-                    -penaltyDailyAmount,
-                    JSON.stringify({ workDate: day.workDate, lateMinutes: day.lateMinutes }),
-                  ]
-                );
-              }
-            }
-          }
         }
 
-        // 3. Custom Adjustments
-        for (const adj of empAdjustments) {
-          if (adj.status === 'ACTIVE') {
-            const isIncrease = adj.direction === 'INCREASE';
-            const lineType = adj.category === 'ADDITION'
-              ? 'ADDITION'
-              : (adj.category === 'BASE_ADJUSTMENT' ? 'BASE_ADJUSTMENT' : 'OTHER_DEDUCTION');
-            const signedAmount = isIncrease ? adj.adjustmentValue : -adj.adjustmentValue;
+        // 3. Late penalty lines (one per qualifying day, amounts already rounded by the engine)
+        if (empSalaryRecord) {
+          for (const day of calc.dailyResults) {
+            if (!day.qualifiesLateDeduction) continue;
+            const inputDay = dailyInputs.find((di) => di.scheduleDayId === day.scheduleDayId);
+            if (!inputDay || inputDay.attendanceDayId.startsWith('synth-')) continue;
+            const attDayId = inputDay.attendanceDayId;
 
             await conn.execute(
-              `INSERT INTO payroll_lines 
+              `INSERT INTO late_penalties
+                (restaurant_id, employee_id, attendance_day_id, policy_version_id, salary_version_id, qualifies, late_minutes, daily_salary_basis, deduction_percentage, calculated_amount, source_attendance_version)
+               VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, 1)
+               ON DUPLICATE KEY UPDATE
+                policy_version_id = VALUES(policy_version_id),
+                salary_version_id = VALUES(salary_version_id),
+                qualifies = VALUES(qualifies),
+                late_minutes = VALUES(late_minutes),
+                daily_salary_basis = VALUES(daily_salary_basis),
+                deduction_percentage = VALUES(deduction_percentage),
+                calculated_amount = VALUES(calculated_amount)`,
+              [
+                restaurantId,
+                empId,
+                attDayId,
+                policyRecord.id,
+                empSalaryRecord.id,
+                day.lateMinutes,
+                calc.dailyRate,
+                policySnapshot.lateDeductionPercentage,
+                day.lateDeductionAmount,
+              ]
+            );
+            const [penRows] = await conn.execute<RowDataPacket[]>(
+              `SELECT id FROM late_penalties WHERE restaurant_id = ? AND attendance_day_id = ?`,
+              [restaurantId, attDayId]
+            );
+            const penaltyId = penRows[0]?.id;
+            if (!penaltyId) continue;
+
+            await conn.execute(
+              `INSERT INTO payroll_lines
                 (restaurant_id, calculation_run_id, employee_id, line_key, line_type, salary_adjustment_id, late_penalty_id, payroll_daily_result_id, description, quantity, unit, rate_snapshot, signed_amount, source_snapshot)
-               VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, 1, 'ITEM', ?, ?, ?)`,
+               VALUES (?, ?, ?, ?, 'LATE_DEDUCTION', NULL, ?, NULL, ?, 1, 'DAY', ?, ?, ?)`,
               [
                 restaurantId,
                 calculationRunId,
                 empId,
-                `ADJ_${adj.id}`,
-                lineType,
-                adj.id,
-                adj.reason,
-                adj.adjustmentValue,
-                signedAmount,
-                JSON.stringify({ adjustmentId: adj.id, reason: adj.reason }),
+                `LATE_${day.workDate}`,
+                penaltyId,
+                `Late arrival penalty (${day.lateMinutes} mins) on ${day.workDate}`,
+                day.lateDeductionAmount,
+                -day.lateDeductionAmount,
+                JSON.stringify({ workDate: day.workDate, lateMinutes: day.lateMinutes }),
               ]
             );
           }
+        }
+
+        // 4. Adjustment lines come straight from the engine so they always reconcile with the totals
+        for (const line of calc.payrollLines.filter((l) => l.sourceRecordId)) {
+          await conn.execute(
+            `INSERT INTO payroll_lines
+              (restaurant_id, calculation_run_id, employee_id, line_key, line_type, salary_adjustment_id, late_penalty_id, payroll_daily_result_id, description, quantity, unit, rate_snapshot, signed_amount, source_snapshot)
+             VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, 1, 'ITEM', ?, ?, ?)`,
+            [
+              restaurantId,
+              calculationRunId,
+              empId,
+              line.lineKey,
+              line.lineType,
+              line.sourceRecordId!,
+              line.description,
+              line.rateSnapshot,
+              line.signedAmount,
+              JSON.stringify({ adjustmentId: line.sourceRecordId, reason: line.description }),
+            ]
+          );
         }
       }
 

@@ -1,7 +1,8 @@
+import { todayIso, nextMonthStart } from '../lib/format';
 import React, { useState } from 'react';
 import { useParams } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { employeesApi, configApi, platformApi } from '../lib/api';
+import { employeesApi, configApi, restaurantApi } from '../lib/api';
 import {
   Plus,
   Search,
@@ -12,7 +13,7 @@ import {
 } from 'lucide-react';
 
 export const EmployeesPage: React.FC = () => {
-  const { restaurantId = '1' } = useParams<{ restaurantId: string }>();
+  const { restaurantId = '' } = useParams<{ restaurantId: string }>();
   const queryClient = useQueryClient();
 
   const [searchTerm, setSearchTerm] = useState('');
@@ -22,6 +23,7 @@ export const EmployeesPage: React.FC = () => {
   const [showAddModal, setShowAddModal] = useState(false);
   const [selectedEmployeeForSalary, setSelectedEmployeeForSalary] = useState<any | null>(null);
   const [modalError, setModalError] = useState<string | null>(null);
+  const [listError, setListError] = useState<string | null>(null);
 
   // Add Employee Form State
   const [addForm, setAddForm] = useState({
@@ -29,21 +31,21 @@ export const EmployeesPage: React.FC = () => {
     fullName: '',
     mobile: '',
     positionId: '',
-    employmentStartDate: '2026-09-01',
+    employmentStartDate: todayIso(),
     initialSalary: '1000.00',
     reason: 'Initial employment contract',
   });
 
   // New Salary Revision State
   const [salaryForm, setSalaryForm] = useState({
-    effectiveFromMonth: '2026-10-01',
+    effectiveFromMonth: nextMonthStart(),
     monthlySalary: '',
     reason: 'Annual salary review',
   });
 
   const { data: restaurant } = useQuery({
     queryKey: ['restaurant-info', restaurantId],
-    queryFn: () => platformApi.getRestaurant(restaurantId),
+    queryFn: () => restaurantApi.getProfile(restaurantId),
   });
 
   const { data: positions = [] } = useQuery({
@@ -66,7 +68,7 @@ export const EmployeesPage: React.FC = () => {
         fullName: '',
         mobile: '',
         positionId: '',
-        employmentStartDate: '2026-09-01',
+        employmentStartDate: todayIso(),
         initialSalary: '1000.00',
         reason: 'Initial employment contract',
       });
@@ -86,7 +88,7 @@ export const EmployeesPage: React.FC = () => {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['employees', restaurantId] });
       setSelectedEmployeeForSalary(null);
-      setSalaryForm({ effectiveFromMonth: '2026-10-01', monthlySalary: '', reason: 'Salary review' });
+      setSalaryForm({ effectiveFromMonth: nextMonthStart(), monthlySalary: '', reason: 'Salary review' });
     },
     onError: (err: any) => {
       setModalError(err.message || 'Failed to record salary revision');
@@ -95,8 +97,13 @@ export const EmployeesPage: React.FC = () => {
 
   const updateStatusMutation = useMutation({
     mutationFn: ({ id, status, version }: { id: string; status: 'ACTIVE' | 'INACTIVE'; version: number }) =>
-      employeesApi.update(restaurantId, id, { status, expectedVersion: version }),
+      employeesApi.updateStatus(restaurantId, id, status, version),
     onSuccess: () => {
+      setListError(null);
+      queryClient.invalidateQueries({ queryKey: ['employees', restaurantId] });
+    },
+    onError: (err: any) => {
+      setListError(err.message || 'Failed to change employee status');
       queryClient.invalidateQueries({ queryKey: ['employees', restaurantId] });
     },
   });
@@ -116,12 +123,12 @@ export const EmployeesPage: React.FC = () => {
 
   return (
     <div>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '1.75rem', flexWrap: 'wrap', gap: '1rem' }}>
+      <div className="page-header">
         <div>
-          <h1 style={{ fontSize: '1.75rem', fontWeight: 700, letterSpacing: '-0.02em' }}>
-            Workforce Directory
+          <h1 className="page-title">
+            Employees
           </h1>
-          <p style={{ color: 'var(--text-muted)', fontSize: '0.875rem', marginTop: '0.25rem' }}>
+          <p className="page-subtitle">
             Manage staff rosters, position assignments, and append-only salary histories.
           </p>
         </div>
@@ -179,6 +186,26 @@ export const EmployeesPage: React.FC = () => {
           </div>
         </div>
       </div>
+
+      {listError && (
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: '0.5rem',
+            padding: '0.75rem',
+            backgroundColor: 'var(--status-danger-bg)',
+            border: '1px solid var(--status-danger-border)',
+            borderRadius: 'var(--radius-md)',
+            color: 'var(--status-danger-text)',
+            fontSize: '0.8125rem',
+            marginBottom: '1rem',
+          }}
+        >
+          <AlertCircle size={16} />
+          <span>{listError}</span>
+        </div>
+      )}
 
       {/* Employees Table */}
       <div className="card" style={{ padding: 0 }}>
@@ -240,7 +267,7 @@ export const EmployeesPage: React.FC = () => {
                             setModalError(null);
                             setSelectedEmployeeForSalary(emp);
                             setSalaryForm({
-                              effectiveFromMonth: '2026-10-01',
+                              effectiveFromMonth: nextMonthStart(),
                               monthlySalary: String(emp.monthlySalary || ''),
                               reason: 'Salary adjustment',
                             });
@@ -297,7 +324,7 @@ export const EmployeesPage: React.FC = () => {
                   backgroundColor: 'var(--status-danger-bg)',
                   border: '1px solid var(--status-danger-border)',
                   borderRadius: 'var(--radius-md)',
-                  color: '#991b1b',
+                  color: 'var(--status-danger-text)',
                   fontSize: '0.8125rem',
                   marginBottom: '1rem',
                 }}
@@ -433,7 +460,7 @@ export const EmployeesPage: React.FC = () => {
                   backgroundColor: 'var(--status-danger-bg)',
                   border: '1px solid var(--status-danger-border)',
                   borderRadius: 'var(--radius-md)',
-                  color: '#991b1b',
+                  color: 'var(--status-danger-text)',
                   fontSize: '0.8125rem',
                   marginBottom: '1rem',
                 }}

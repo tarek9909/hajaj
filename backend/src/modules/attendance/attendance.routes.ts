@@ -1,77 +1,99 @@
 import { Router, type Request, type Response, type NextFunction } from 'express';
-import type { RowDataPacket, ResultSetHeader } from 'mysql2/promise';
+import type { PoolConnection, RowDataPacket, ResultSetHeader } from 'mysql2/promise';
+import crypto from 'crypto';
+import { z } from 'zod';
 import { DateTime } from 'luxon';
 import { Decimal } from 'decimal.js';
 import { withTransaction, pool } from '../../infrastructure/database/pool.js';
-import { updateAttendanceDaySchema } from '../../contracts/schemas.js';
 import { AppError } from '../../middleware/errorHandler.js';
 import { recordAuditEvent } from '../../infrastructure/logging/audit.js';
+import { bumpSourceRevision } from '../configuration/periodGuards.js';
 
 export const attendanceRouter = Router({ mergeParams: true });
 
-// GET /api/v1/restaurants/:restaurantId/attendance?date=YYYY-MM-DD
-attendanceRouter.get('/', async (req: Request, res: Response, next: NextFunction) => {
+const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+// An ISO datetime that carries an explicit offset (Z or +hh:mm)
+const ISO_WITH_OFFSET_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})$/;
+const SQL_DT = 'yyyy-MM-dd HH:mm:ss.000';
+
+/**
+ * Body for PUT /attendance/days/:attendanceDayId and PUT /attendance/days/by-schedule/:scheduleDayId.
+ * expectedVersion is the attendance row version the client last saw (0 when the day has no attendance row yet).
+ */
+const saveAttendanceSchema = z.object({
+  status: z.enum(['NOT_RECORDED', 'IN_PROGRESS', 'COMPLETED', 'CONFIRMED_ABSENT', 'EXCUSED', 'NEEDS_REVIEW']),
+  additionalWorkApproved: z.boolean().default(false),
+  notes: z.string().max(5000).optional().nullable(),
+  expectedVersion: z.number().int().min(0).optional(),
+  intervals: z
+    .array(
+      z.object({
+        scheduleIntervalId: z.string().optional().nullable(),
+        sequenceNumber: z.number().int().positive(),
+        checkInAt: z.string(),
+        checkOutAt: z.string().optional().nullable(),
+        unpaidBreakMinutes: z.number().int().min(0).default(0),
+      })
+    )
+    .max(10)
+    .default([]),
+});
+
+const STATUSES_WITH_INTERVALS = ['IN_PROGRESS', 'COMPLETED', 'NEEDS_REVIEW'];
+
+function mapPlanned(i: RowDataPacket) {
+  return {
+    id: String(i.id),
+    sequenceNumber: i.sequence_number,
+    plannedStartAt: i.planned_start_at,
+    plannedEndAt: i.planned_end_at,
+    plannedUnpaidBreakMinutes: i.planned_unpaid_break_minutes,
+  };
+}
+
+// GET /api/v1/restaurants/:restaurantId/attendance/daily?date=YYYY-MM-DD  (alias: GET /attendance?date=...)
+// Read-only: returns one row per scheduled day. attendanceDayId is null until attendance is first saved.
+const getDaily = async (req: Request, res: Response, next: NextFunction) => {
   try {
     const restaurantId = req.tenantContext!.restaurantId;
-    const date = (req.query.date as string) || DateTime.utc().toISODate()!;
-
-    // 1. Ensure attendance_days records exist for all scheduled employees on this date
-    const [scheduledDays] = await pool.execute<RowDataPacket[]>(
-      `SELECT d.id, d.employee_id, d.work_date 
-       FROM schedule_days d
-       LEFT JOIN attendance_days a ON a.restaurant_id = d.restaurant_id AND a.schedule_day_id = d.id
-       WHERE d.restaurant_id = ? AND d.work_date = ? AND a.id IS NULL`,
-      [restaurantId, date]
-    );
-
-    if (scheduledDays.length > 0) {
-      const actorId = req.tenantContext!.actorId;
-      for (const sd of scheduledDays) {
-        await pool.execute(
-          `INSERT IGNORE INTO attendance_days 
-            (restaurant_id, employee_id, schedule_day_id, work_date, status, created_by, updated_by)
-           VALUES (?, ?, ?, ?, 'NOT_RECORDED', ?, ?)`,
-          [restaurantId, sd.employee_id, sd.id, date, actorId, actorId]
-        );
-      }
+    const date = req.query.date ? String(req.query.date) : DateTime.utc().toISODate()!;
+    if (!ISO_DATE_RE.test(date) || !DateTime.fromISO(date).isValid) {
+      throw new AppError(422, 'INVALID_QUERY', 'date must be a valid YYYY-MM-DD date');
     }
 
-    // 2. Fetch attendance rows joined with employee, schedule, intervals, warning, penalty
     const [rows] = await pool.execute<RowDataPacket[]>(
-      `SELECT 
+      `SELECT
         a.id AS attendance_day_id,
-        a.employee_id,
-        e.full_name AS employee_name,
+        d.employee_id,
+        e.full_name,
         e.employee_number,
         p.name AS position_name,
-        a.schedule_day_id,
+        d.id AS schedule_day_id,
         d.day_type,
         d.required_minutes,
         t.name AS template_name,
-        a.work_date,
-        a.status AS attendance_status,
-        a.additional_work_approved,
+        DATE_FORMAT(d.work_date, '%Y-%m-%d') AS work_date,
+        COALESCE(a.status, 'NOT_RECORDED') AS status,
+        COALESCE(a.additional_work_approved, 0) AS additional_work_approved,
         a.notes,
-        a.row_version,
+        COALESCE(a.row_version, 0) AS row_version,
         w.id AS automatic_warning_id,
-        w.late_minutes AS warning_late_minutes,
         w.system_qualifies AS warning_system_qualifies,
         w.admin_voided AS warning_admin_voided,
         lp.qualifies AS penalty_qualifies,
         lp.calculated_amount AS penalty_amount
-       FROM attendance_days a
-       JOIN employees e ON e.id = a.employee_id
-       JOIN positions p ON p.id = e.position_id
-       JOIN schedule_days d ON d.id = a.schedule_day_id
-       LEFT JOIN shift_templates t ON t.id = d.source_template_id
-       LEFT JOIN warnings w ON w.restaurant_id = a.restaurant_id AND w.automatic_attendance_day_id = a.id
-       LEFT JOIN late_penalties lp ON lp.restaurant_id = a.restaurant_id AND lp.attendance_day_id = a.id
-       WHERE a.restaurant_id = ? AND a.work_date = ?
+       FROM schedule_days d
+       JOIN employees e ON e.restaurant_id = d.restaurant_id AND e.id = d.employee_id
+       JOIN positions p ON p.restaurant_id = e.restaurant_id AND p.id = e.position_id
+       LEFT JOIN attendance_days a ON a.restaurant_id = d.restaurant_id AND a.schedule_day_id = d.id
+       LEFT JOIN shift_templates t ON t.restaurant_id = d.restaurant_id AND t.id = d.source_template_id
+       LEFT JOIN warnings w ON w.restaurant_id = d.restaurant_id AND w.automatic_attendance_day_id = a.id
+       LEFT JOIN late_penalties lp ON lp.restaurant_id = d.restaurant_id AND lp.attendance_day_id = a.id
+       WHERE d.restaurant_id = ? AND d.work_date = ?
        ORDER BY e.full_name ASC`,
       [restaurantId, date]
     );
 
-    // Fetch planned intervals
     const [plannedIntervals] = await pool.execute<RowDataPacket[]>(
       `SELECT i.id, i.schedule_day_id, i.sequence_number,
               DATE_FORMAT(i.planned_start_at, '%Y-%m-%dT%H:%i:%s.000Z') AS planned_start_at,
@@ -84,7 +106,6 @@ attendanceRouter.get('/', async (req: Request, res: Response, next: NextFunction
       [restaurantId, date]
     );
 
-    // Fetch actual attendance intervals
     const [actualIntervals] = await pool.execute<RowDataPacket[]>(
       `SELECT ai.id, ai.attendance_day_id, ai.schedule_interval_id, ai.sequence_number,
               DATE_FORMAT(ai.check_in_at, '%Y-%m-%dT%H:%i:%s.000Z') AS check_in_at,
@@ -99,78 +120,476 @@ attendanceRouter.get('/', async (req: Request, res: Response, next: NextFunction
 
     const data = rows.map((r) => {
       const pl = plannedIntervals.filter((i) => String(i.schedule_day_id) === String(r.schedule_day_id));
-      const act = actualIntervals.filter((i) => String(i.attendance_day_id) === String(r.attendance_day_id));
+      const act = r.attendance_day_id
+        ? actualIntervals.filter((i) => String(i.attendance_day_id) === String(r.attendance_day_id))
+        : [];
 
-      // Calculate on-the-fly worked minutes
       let workedMinutes = 0;
-      let isComplete = r.attendance_status === 'COMPLETED';
       let hasArrival = false;
       let maxLate = 0;
 
-      for (let idx = 0; idx < act.length; idx++) {
-        const aInt = act[idx]!;
+      const actualOut = act.map((aInt) => {
+        const plan =
+          pl.find((p) => aInt.schedule_interval_id && String(p.id) === String(aInt.schedule_interval_id)) ||
+          pl.find((p) => p.sequence_number === aInt.sequence_number);
+        let late = 0;
+        let worked = 0;
+        const inDt = DateTime.fromISO(aInt.check_in_at, { setZone: true });
         if (aInt.check_in_at) {
           hasArrival = true;
-          const pInt = pl[idx];
-          if (pInt && pInt.planned_start_at) {
-            const inDt = DateTime.fromISO(aInt.check_in_at, { setZone: true });
-            const pDt = DateTime.fromISO(pInt.planned_start_at, { setZone: true });
-            const diff = Math.floor(inDt.diff(pDt, 'minutes').minutes);
-            if (diff > maxLate) maxLate = diff;
+          if (plan?.planned_start_at) {
+            const diff = Math.floor(inDt.diff(DateTime.fromISO(plan.planned_start_at, { setZone: true }), 'minutes').minutes);
+            late = Math.max(0, diff);
+            if (late > maxLate) maxLate = late;
           }
         }
         if (aInt.check_in_at && aInt.check_out_at) {
-          const inDt = DateTime.fromISO(aInt.check_in_at);
-          const outDt = DateTime.fromISO(aInt.check_out_at);
-          const dur = Math.floor(outDt.diff(inDt, 'minutes').minutes);
-          workedMinutes += Math.max(0, dur - (aInt.unpaid_break_minutes || 0));
+          const dur = Math.floor(DateTime.fromISO(aInt.check_out_at).diff(inDt, 'minutes').minutes);
+          worked = Math.max(0, dur - (aInt.unpaid_break_minutes || 0));
+          workedMinutes += worked;
         }
-      }
+        return {
+          id: String(aInt.id),
+          scheduleIntervalId: aInt.schedule_interval_id ? String(aInt.schedule_interval_id) : null,
+          sequenceNumber: aInt.sequence_number,
+          checkInAt: aInt.check_in_at,
+          checkOutAt: aInt.check_out_at,
+          unpaidBreakMinutes: aInt.unpaid_break_minutes,
+          lateMinutes: late,
+          workedMinutes: worked,
+        };
+      });
 
-      const shortfallMinutes = isComplete ? Math.max(0, r.required_minutes - workedMinutes) : null;
-      const additionalMinutes = isComplete ? Math.max(0, workedMinutes - r.required_minutes) : null;
+      const isComplete = r.status === 'COMPLETED';
+      const requiredMinutes = Number(r.required_minutes);
+      const attendanceDayId = r.attendance_day_id ? String(r.attendance_day_id) : null;
 
       return {
-        attendanceDayId: String(r.attendance_day_id),
+        attendanceDayId,
         employeeId: String(r.employee_id),
-        employeeName: r.employee_name,
         employeeNumber: r.employee_number,
+        fullName: r.full_name,
+        employeeName: r.full_name,
         positionName: r.position_name,
         scheduleDayId: String(r.schedule_day_id),
         dayType: r.day_type,
         templateName: r.template_name,
-        requiredMinutes: r.required_minutes,
+        requiredMinutes,
         workDate: r.work_date,
-        attendanceStatus: r.attendance_status,
+        status: r.status,
+        attendanceStatus: r.status,
         additionalWorkApproved: Boolean(r.additional_work_approved),
         notes: r.notes,
         workedMinutes: isComplete ? workedMinutes : null,
-        shortfallMinutes,
-        additionalMinutes,
+        shortfallMinutes: isComplete ? Math.max(0, requiredMinutes - workedMinutes) : null,
+        additionalMinutes: isComplete ? Math.max(0, workedMinutes - requiredMinutes) : null,
         lateMinutes: hasArrival ? maxLate : 0,
         qualifiesLatePenalty: Boolean(r.penalty_qualifies),
         latePenaltyAmount: Number(r.penalty_amount || 0),
         hasAutomaticWarning: Boolean(r.automatic_warning_id && r.warning_system_qualifies && !r.warning_admin_voided),
         rowVersion: Number(r.row_version),
-        plannedIntervals: pl.map((i) => ({
-          id: String(i.id),
-          sequenceNumber: i.sequence_number,
-          plannedStartAt: i.planned_start_at,
-          plannedEndAt: i.planned_end_at,
-          plannedUnpaidBreakMinutes: i.planned_unpaid_break_minutes,
-        })),
-        actualIntervals: act.map((i) => ({
-          id: String(i.id),
-          scheduleIntervalId: i.schedule_interval_id ? String(i.schedule_interval_id) : null,
-          sequenceNumber: i.sequence_number,
-          checkInAt: i.check_in_at,
-          checkOutAt: i.check_out_at,
-          unpaidBreakMinutes: i.unpaid_break_minutes,
-        })),
+        plannedIntervals: pl.map(mapPlanned),
+        actualIntervals: actualOut,
       };
     });
 
     res.json({ data, meta: { requestId: req.requestId } });
+  } catch (err) {
+    next(err);
+  }
+};
+attendanceRouter.get('/daily', getDaily);
+attendanceRouter.get('/', getDaily);
+
+interface ParsedActual {
+  scheduleIntervalId: string | null;
+  sequenceNumber: number;
+  checkIn: DateTime;
+  checkOut: DateTime | null;
+  unpaidBreakMinutes: number;
+}
+
+function parseAndValidateIntervals(
+  intervals: z.infer<typeof saveAttendanceSchema>['intervals'],
+  status: string,
+  plannedIds: Set<string>
+): ParsedActual[] {
+  const parse = (v: string, field: string): DateTime => {
+    if (!ISO_WITH_OFFSET_RE.test(v)) {
+      throw new AppError(422, 'INVALID_INTERVAL', `${field} must be an ISO datetime with an explicit UTC offset (e.g. 2026-09-01T08:00:00Z)`);
+    }
+    const dt = DateTime.fromISO(v, { setZone: true });
+    if (!dt.isValid) throw new AppError(422, 'INVALID_INTERVAL', `${field} is not a valid datetime`);
+    if (dt.second !== 0 || dt.millisecond !== 0) {
+      throw new AppError(422, 'INVALID_INTERVAL', `${field} must have zero seconds`);
+    }
+    return dt;
+  };
+
+  const out: ParsedActual[] = [];
+  const seen = new Set<number>();
+  for (const inv of intervals) {
+    if (seen.has(inv.sequenceNumber)) {
+      throw new AppError(422, 'INVALID_INTERVAL', `Duplicate interval sequenceNumber ${inv.sequenceNumber}`);
+    }
+    seen.add(inv.sequenceNumber);
+
+    const checkIn = parse(inv.checkInAt, `Interval ${inv.sequenceNumber} checkInAt`);
+    const checkOut = inv.checkOutAt ? parse(inv.checkOutAt, `Interval ${inv.sequenceNumber} checkOutAt`) : null;
+    if (checkOut) {
+      const dur = Math.round(checkOut.diff(checkIn, 'minutes').minutes);
+      if (dur <= 0) {
+        throw new AppError(422, 'INVALID_INTERVAL', `Interval ${inv.sequenceNumber}: check-out must be after check-in`);
+      }
+      if (inv.unpaidBreakMinutes >= dur) {
+        throw new AppError(422, 'INVALID_INTERVAL', `Interval ${inv.sequenceNumber}: unpaid break must be shorter than the interval`);
+      }
+    } else if (status === 'COMPLETED') {
+      throw new AppError(422, 'INVALID_INTERVAL', 'A completed day needs a check-out time on every interval');
+    }
+    if (inv.scheduleIntervalId && !plannedIds.has(String(inv.scheduleIntervalId))) {
+      throw new AppError(422, 'INVALID_INTERVAL', `Interval ${inv.sequenceNumber}: scheduleIntervalId does not belong to this schedule day`);
+    }
+    out.push({
+      scheduleIntervalId: inv.scheduleIntervalId ? String(inv.scheduleIntervalId) : null,
+      sequenceNumber: inv.sequenceNumber,
+      checkIn,
+      checkOut,
+      unpaidBreakMinutes: inv.unpaidBreakMinutes,
+    });
+  }
+
+  const sorted = [...out].sort((a, b) => a.checkIn.toMillis() - b.checkIn.toMillis());
+  for (let i = 1; i < sorted.length; i++) {
+    const prevEnd = sorted[i - 1]!.checkOut;
+    if (!prevEnd || sorted[i]!.checkIn.toMillis() < prevEnd.toMillis()) {
+      throw new AppError(422, 'INVALID_INTERVAL', 'Attendance intervals must not overlap');
+    }
+  }
+  if ((status === 'COMPLETED' || status === 'IN_PROGRESS') && out.length === 0) {
+    throw new AppError(422, 'INVALID_INTERVAL', `${status} requires at least one interval`);
+  }
+  return out;
+}
+
+async function saveAttendance(
+  req: Request,
+  target: { attendanceDayId: string } | { scheduleDayId: string }
+): Promise<{ attendanceDayId: string; rowVersion: number }> {
+  const restaurantId = req.tenantContext!.restaurantId;
+  const actorId = req.tenantContext!.actorId;
+  const body = saveAttendanceSchema.parse(req.body);
+
+  return withTransaction(async (conn: PoolConnection) => {
+    // 1. Lock the schedule day (and period) and resolve / lazily create the attendance day
+    const baseSelect = `SELECT d.id AS schedule_day_id, d.employee_id, d.day_type,
+              DATE_FORMAT(d.work_date, '%Y-%m-%d') AS work_date,
+              DATE_FORMAT(d.payroll_month, '%Y-%m-%d') AS payroll_month,
+              d.required_minutes, p.status AS period_status
+       FROM schedule_days d
+       JOIN payroll_periods p ON p.restaurant_id = d.restaurant_id AND p.month_start = d.payroll_month`;
+
+    let scheduleDayId: string;
+    if ('scheduleDayId' in target) {
+      scheduleDayId = target.scheduleDayId;
+    } else {
+      const [ref] = await conn.execute<RowDataPacket[]>(
+        `SELECT schedule_day_id FROM attendance_days WHERE restaurant_id = ? AND id = ?`,
+        [restaurantId, target.attendanceDayId]
+      );
+      if (!ref[0]) throw new AppError(404, 'ATTENDANCE_NOT_FOUND', 'Attendance day record not found');
+      scheduleDayId = String(ref[0].schedule_day_id);
+    }
+    if (!/^\d+$/.test(scheduleDayId)) throw new AppError(404, 'SCHEDULE_DAY_NOT_FOUND', 'Schedule day not found');
+
+    const [dayRows] = await conn.execute<RowDataPacket[]>(
+      `${baseSelect} WHERE d.restaurant_id = ? AND d.id = ? FOR UPDATE`,
+      [restaurantId, scheduleDayId]
+    );
+    const day = dayRows[0];
+    if (!day) throw new AppError(404, 'SCHEDULE_DAY_NOT_FOUND', 'Schedule day not found');
+    if (day.period_status === 'FINALIZED') {
+      throw new AppError(409, 'PAYROLL_PERIOD_FINALIZED', 'Cannot modify attendance in a finalized month');
+    }
+
+    const [attRows] = await conn.execute<RowDataPacket[]>(
+      `SELECT id, status, row_version FROM attendance_days WHERE restaurant_id = ? AND schedule_day_id = ? FOR UPDATE`,
+      [restaurantId, scheduleDayId]
+    );
+    let attendanceDayId: string;
+    let currentVersion: number;
+    let previousStatus: string | null = null;
+
+    if (attRows[0]) {
+      attendanceDayId = String(attRows[0].id);
+      currentVersion = Number(attRows[0].row_version);
+      previousStatus = attRows[0].status;
+      if ('attendanceDayId' in target && target.attendanceDayId !== attendanceDayId) {
+        throw new AppError(404, 'ATTENDANCE_NOT_FOUND', 'Attendance day record not found');
+      }
+      if (body.expectedVersion === undefined) {
+        throw new AppError(422, 'VALIDATION_ERROR', 'expectedVersion is required when updating an existing attendance record');
+      }
+      if (body.expectedVersion !== currentVersion) {
+        throw new AppError(409, 'ROW_VERSION_CONFLICT', 'Attendance record was modified by another administrator');
+      }
+    } else {
+      if ('attendanceDayId' in target) throw new AppError(404, 'ATTENDANCE_NOT_FOUND', 'Attendance day record not found');
+      if (body.expectedVersion !== undefined && body.expectedVersion !== 0) {
+        throw new AppError(409, 'ROW_VERSION_CONFLICT', 'Attendance record was modified by another administrator');
+      }
+      const [ins] = await conn.execute<ResultSetHeader>(
+        `INSERT INTO attendance_days
+          (restaurant_id, employee_id, schedule_day_id, work_date, status, created_by, updated_by)
+         VALUES (?, ?, ?, ?, 'NOT_RECORDED', ?, ?)`,
+        [restaurantId, day.employee_id, scheduleDayId, day.work_date, actorId, actorId]
+      );
+      attendanceDayId = String(ins.insertId);
+      currentVersion = 1;
+    }
+
+    // 2. Planned intervals of this schedule day (validation + lateness)
+    const [plannedIntervals] = await conn.execute<RowDataPacket[]>(
+      `SELECT id, sequence_number, planned_start_at
+       FROM schedule_intervals
+       WHERE restaurant_id = ? AND schedule_day_id = ?
+       ORDER BY sequence_number ASC`,
+      [restaurantId, scheduleDayId]
+    );
+    const plannedIds = new Set(plannedIntervals.map((p) => String(p.id)));
+
+    // 3. Validate intervals. Absent/excused/not-recorded days carry no clock data.
+    const keepIntervals = STATUSES_WITH_INTERVALS.includes(body.status);
+    const parsed = keepIntervals ? parseAndValidateIntervals(body.intervals, body.status, plannedIds) : [];
+
+    // 4. Update the attendance day with an optimistic lock
+    const [updRes] = await conn.execute<ResultSetHeader>(
+      `UPDATE attendance_days
+       SET status = ?,
+           additional_work_approved = ?,
+           notes = ?,
+           row_version = row_version + 1,
+           updated_by = ?
+       WHERE restaurant_id = ? AND id = ? AND row_version = ?`,
+      [
+        body.status,
+        body.additionalWorkApproved ? 1 : 0,
+        body.notes || null,
+        actorId,
+        restaurantId,
+        attendanceDayId,
+        currentVersion,
+      ]
+    );
+    if (updRes.affectedRows === 0) {
+      throw new AppError(409, 'ROW_VERSION_CONFLICT', 'Attendance record was modified by another administrator');
+    }
+    const newVersion = currentVersion + 1;
+
+    // 5. Replace attendance intervals
+    await conn.execute(`DELETE FROM attendance_intervals WHERE restaurant_id = ? AND attendance_day_id = ?`, [
+      restaurantId,
+      attendanceDayId,
+    ]);
+
+    let maxLateMinutes = 0;
+    let totalWorkedMinutes = 0;
+    for (const inv of parsed) {
+      await conn.execute(
+        `INSERT INTO attendance_intervals
+          (restaurant_id, employee_id, schedule_day_id, attendance_day_id, schedule_interval_id, sequence_number, check_in_at, check_out_at, unpaid_break_minutes)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          restaurantId,
+          day.employee_id,
+          scheduleDayId,
+          attendanceDayId,
+          inv.scheduleIntervalId,
+          inv.sequenceNumber,
+          inv.checkIn.toUTC().toFormat(SQL_DT),
+          inv.checkOut ? inv.checkOut.toUTC().toFormat(SQL_DT) : null,
+          inv.unpaidBreakMinutes,
+        ]
+      );
+
+      // Lateness against the matching planned interval (by id, else by sequence number)
+      const plan =
+        plannedIntervals.find((p) => inv.scheduleIntervalId && String(p.id) === inv.scheduleIntervalId) ||
+        plannedIntervals.find((p) => p.sequence_number === inv.sequenceNumber);
+      if (plan?.planned_start_at) {
+        const planDt = DateTime.fromJSDate(plan.planned_start_at as Date);
+        const diff = Math.floor(inv.checkIn.diff(planDt, 'minutes').minutes);
+        if (diff > maxLateMinutes) maxLateMinutes = diff;
+      }
+      if (inv.checkOut) {
+        const dur = Math.floor(inv.checkOut.diff(inv.checkIn, 'minutes').minutes);
+        totalWorkedMinutes += Math.max(0, dur - inv.unpaidBreakMinutes);
+      }
+    }
+
+    // 6. Lateness policy, penalty and warning (policy/salary in force for the payroll month)
+    const [policyRows] = await conn.execute<RowDataPacket[]>(
+      `SELECT id, late_grace_minutes, late_deduction_percentage, salary_working_day_divisor
+       FROM restaurant_policy_versions
+       WHERE restaurant_id = ? AND effective_from_month <= ?
+       ORDER BY effective_from_month DESC, revision_no DESC LIMIT 1`,
+      [restaurantId, day.payroll_month]
+    );
+    const policy = policyRows[0];
+    if (!policy) throw new AppError(422, 'NO_POLICY_CONFIGURED', 'No effective policy found for this month');
+    const grace = Number(policy.late_grace_minutes);
+    const lateDeductPct = new Decimal(policy.late_deduction_percentage);
+    const divisor = Number(policy.salary_working_day_divisor);
+
+    const qualifiesLate = maxLateMinutes > grace;
+
+    const [salRows] = await conn.execute<RowDataPacket[]>(
+      `SELECT id, monthly_salary FROM employee_salary_versions
+       WHERE restaurant_id = ? AND employee_id = ? AND effective_from_month <= ?
+       ORDER BY effective_from_month DESC, revision_no DESC LIMIT 1`,
+      [restaurantId, day.employee_id, day.payroll_month]
+    );
+    const salaryVersion = salRows[0];
+
+    if (salaryVersion) {
+      const [restRows] = await conn.execute<RowDataPacket[]>(
+        `SELECT currency_decimal_places FROM restaurants WHERE id = ?`,
+        [restaurantId]
+      );
+      const currencyDp = Number(restRows[0]?.currency_decimal_places ?? 2);
+
+      const dailySalary = new Decimal(salaryVersion.monthly_salary).dividedBy(divisor);
+      const lateDeductionAmount = qualifiesLate
+        ? dailySalary.times(lateDeductPct).dividedBy(100).toDecimalPlaces(currencyDp, Decimal.ROUND_HALF_UP)
+        : new Decimal(0);
+
+      await conn.execute(
+        `INSERT INTO late_penalties
+          (restaurant_id, employee_id, attendance_day_id, policy_version_id, salary_version_id, qualifies, late_minutes, daily_salary_basis, deduction_percentage, calculated_amount, source_attendance_version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+           policy_version_id = VALUES(policy_version_id),
+           salary_version_id = VALUES(salary_version_id),
+           qualifies = VALUES(qualifies),
+           late_minutes = VALUES(late_minutes),
+           daily_salary_basis = VALUES(daily_salary_basis),
+           deduction_percentage = VALUES(deduction_percentage),
+           calculated_amount = VALUES(calculated_amount),
+           source_attendance_version = VALUES(source_attendance_version)`,
+        [
+          restaurantId,
+          day.employee_id,
+          attendanceDayId,
+          policy.id,
+          salaryVersion.id,
+          qualifiesLate ? 1 : 0,
+          maxLateMinutes,
+          dailySalary.toDecimalPlaces(8, Decimal.ROUND_HALF_UP).toFixed(8),
+          lateDeductPct.toFixed(4),
+          lateDeductionAmount.toFixed(4),
+          newVersion,
+        ]
+      );
+    }
+
+    if (qualifiesLate) {
+      await conn.execute(
+        `INSERT INTO warnings
+          (restaurant_id, employee_id, origin, automatic_attendance_day_id, incident_date, title, reason, late_minutes, system_qualifies, counts_toward_limit, admin_voided)
+         VALUES (?, ?, 'AUTOMATIC_LATE', ?, ?, 'Late Arrival', ?, ?, 1, 1, 0)
+         ON DUPLICATE KEY UPDATE
+           late_minutes = VALUES(late_minutes),
+           reason = VALUES(reason),
+           system_qualifies = 1`,
+        [
+          restaurantId,
+          day.employee_id,
+          attendanceDayId,
+          day.work_date,
+          `Arrived ${maxLateMinutes} minutes late (grace period: ${grace} mins)`,
+          maxLateMinutes,
+        ]
+      );
+    } else {
+      // Preserve history: just stop the system from counting it
+      await conn.execute(
+        `UPDATE warnings
+         SET system_qualifies = 0
+         WHERE restaurant_id = ? AND automatic_attendance_day_id = ?`,
+        [restaurantId, attendanceDayId]
+      );
+    }
+
+    // 7. Hour debt source (append-only table: insert if missing, never update/delete;
+    //    the payroll engine ignores sources whose day no longer has a shortfall)
+    if (body.status === 'COMPLETED') {
+      const shortfall = Math.max(0, Number(day.required_minutes) - totalWorkedMinutes);
+      if (shortfall > 0) {
+        const [existingSrc] = await conn.execute<RowDataPacket[]>(
+          `SELECT id FROM hour_debt_sources WHERE restaurant_id = ? AND attendance_day_id = ?`,
+          [restaurantId, attendanceDayId]
+        );
+        if (existingSrc.length === 0) {
+          await conn.execute(
+            `INSERT INTO hour_debt_sources
+              (restaurant_id, employee_id, source_type, attendance_day_id, origin_work_date)
+             VALUES (?, ?, 'ATTENDANCE_SHORTFALL', ?, ?)`,
+            [restaurantId, day.employee_id, attendanceDayId, day.work_date]
+          );
+        }
+      }
+    }
+
+    // 8. Invalidate the (non-finalized) period and queue a recalculation
+    await bumpSourceRevision(conn, restaurantId, day.payroll_month, day.payroll_month);
+
+    const monthKey = String(day.payroll_month).slice(0, 7);
+    const deduplicationHash = crypto
+      .createHash('sha256')
+      .update(`PAYROLL_RECALCULATE|${restaurantId}|${monthKey}`)
+      .digest();
+    // Assignments run left to right: once status is kept as RUNNING, the later IFs keep the running job untouched.
+    await conn.execute(
+      `INSERT INTO jobs
+        (restaurant_id, job_type, deduplication_hash, payload, status, requested_by)
+       VALUES (?, 'PAYROLL_RECALCULATE', ?, ?, 'QUEUED', ?)
+       ON DUPLICATE KEY UPDATE
+         status = IF(status = 'RUNNING', status, 'QUEUED'),
+         attempt_count = IF(status = 'RUNNING', attempt_count, 0),
+         available_at = IF(status = 'RUNNING', available_at, CURRENT_TIMESTAMP(3)),
+         error_text = IF(status = 'RUNNING', error_text, NULL),
+         finished_at = IF(status = 'RUNNING', finished_at, NULL)`,
+      [restaurantId, deduplicationHash, JSON.stringify({ month: monthKey, trigger: 'attendance_update' }), actorId]
+    );
+
+    await recordAuditEvent(
+      {
+        restaurantId,
+        actorId,
+        actorKind: req.tenantContext!.accountKind,
+        action: 'UPDATE_ATTENDANCE',
+        entityType: 'ATTENDANCE_DAY',
+        entityId: attendanceDayId,
+        requestId: req.requestId,
+        beforeValues: previousStatus ? { status: previousStatus } : null,
+        afterValues: { status: body.status, workedMinutes: totalWorkedMinutes, maxLateMinutes, scheduleDayId },
+      },
+      conn
+    );
+
+    return { attendanceDayId, rowVersion: newVersion };
+  });
+}
+
+// PUT /api/v1/restaurants/:restaurantId/attendance/days/by-schedule/:scheduleDayId
+// Creates the attendance row lazily on first save (or updates it if it already exists).
+attendanceRouter.put('/days/by-schedule/:scheduleDayId', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const result = await saveAttendance(req, { scheduleDayId: String(req.params.scheduleDayId) });
+    res.json({
+      data: { message: 'Attendance saved and evaluated successfully', ...result },
+      meta: { requestId: req.requestId },
+    });
   } catch (err) {
     next(err);
   }
@@ -179,253 +598,11 @@ attendanceRouter.get('/', async (req: Request, res: Response, next: NextFunction
 // PUT /api/v1/restaurants/:restaurantId/attendance/days/:attendanceDayId
 attendanceRouter.put('/days/:attendanceDayId', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const restaurantId = req.tenantContext!.restaurantId;
     const attendanceDayId = String(req.params.attendanceDayId);
-    const actorId = req.tenantContext!.actorId;
-    const body = updateAttendanceDaySchema.parse(req.body);
-
-    await withTransaction(async (conn) => {
-      // 1. Fetch attendance day, schedule day, and check finalized period
-      const [attRows] = await conn.execute<RowDataPacket[]>(
-        `SELECT a.id, a.employee_id, a.schedule_day_id, DATE_FORMAT(a.work_date, '%Y-%m-%d') AS work_date,
-                a.row_version, d.payroll_month, d.required_minutes, d.policy_version_id, p.status AS period_status
-         FROM attendance_days a
-         JOIN schedule_days d ON d.id = a.schedule_day_id
-         JOIN payroll_periods p ON p.restaurant_id = a.restaurant_id AND p.month_start = d.payroll_month
-         WHERE a.restaurant_id = ? AND a.id = ?`,
-        [restaurantId, attendanceDayId]
-      );
-
-      const att = attRows[0];
-      if (!att) throw new AppError(404, 'ATTENDANCE_NOT_FOUND', 'Attendance day record not found');
-      if (att.period_status === 'FINALIZED') {
-        throw new AppError(409, 'PAYROLL_PERIOD_FINALIZED', 'Cannot modify attendance in a finalized month');
-      }
-      if (Number(att.row_version) !== body.expectedVersion) {
-        throw new AppError(412, 'ROW_VERSION_CONFLICT', 'Attendance record was modified by another administrator');
-      }
-
-      // 2. Fetch planned intervals
-      const [plannedIntervals] = await conn.execute<RowDataPacket[]>(
-        `SELECT id, sequence_number, planned_start_at, planned_end_at, planned_unpaid_break_minutes 
-         FROM schedule_intervals 
-         WHERE restaurant_id = ? AND schedule_day_id = ? 
-         ORDER BY sequence_number ASC`,
-        [restaurantId, att.schedule_day_id]
-      );
-
-      // 3. Update attendance_days record
-      await conn.execute(
-        `UPDATE attendance_days 
-         SET status = ?, 
-             additional_work_approved = ?, 
-             notes = ?, 
-             row_version = row_version + 1, 
-             updated_by = ?
-         WHERE restaurant_id = ? AND id = ?`,
-        [
-          body.status,
-          body.additionalWorkApproved ? 1 : 0,
-          body.notes || null,
-          actorId,
-          restaurantId,
-          attendanceDayId,
-        ]
-      );
-
-      // 4. Replace attendance_intervals
-      await conn.execute(
-        `DELETE FROM attendance_intervals WHERE restaurant_id = ? AND attendance_day_id = ?`,
-        [restaurantId, attendanceDayId]
-      );
-
-      let maxLateMinutes = 0;
-      let totalWorkedMinutes = 0;
-
-      for (const inv of body.intervals) {
-        const inUtc = DateTime.fromISO(inv.checkInAt).toUTC().toFormat('yyyy-MM-dd HH:mm:ss.000');
-        const outUtc = inv.checkOutAt
-          ? DateTime.fromISO(inv.checkOutAt).toUTC().toFormat('yyyy-MM-dd HH:mm:ss.000')
-          : null;
-
-        await conn.execute(
-          `INSERT INTO attendance_intervals 
-            (restaurant_id, employee_id, schedule_day_id, attendance_day_id, schedule_interval_id, sequence_number, check_in_at, check_out_at, unpaid_break_minutes)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          [
-            restaurantId,
-            att.employee_id,
-            att.schedule_day_id,
-            attendanceDayId,
-            inv.scheduleIntervalId || null,
-            inv.sequenceNumber,
-            inUtc,
-            outUtc,
-            inv.unpaidBreakMinutes,
-          ]
-        );
-
-        // Evaluate lateness against corresponding planned interval
-        const plan = plannedIntervals.find((p) => String(p.id) === String(inv.scheduleIntervalId)) || plannedIntervals[inv.sequenceNumber - 1];
-        if (plan && plan.planned_start_at) {
-          const checkInDt = DateTime.fromISO(inv.checkInAt, { setZone: true });
-          const planDt = DateTime.fromISO(DateTime.fromJSDate(plan.planned_start_at).toISO()!, { setZone: true });
-          const diff = Math.floor(checkInDt.diff(planDt, 'minutes').minutes);
-          if (diff > maxLateMinutes) maxLateMinutes = diff;
-        }
-
-        if (inv.checkInAt && inv.checkOutAt) {
-          const inDt = DateTime.fromISO(inv.checkInAt);
-          const outDt = DateTime.fromISO(inv.checkOutAt);
-          const dur = Math.floor(outDt.diff(inDt, 'minutes').minutes);
-          totalWorkedMinutes += Math.max(0, dur - inv.unpaidBreakMinutes);
-        }
-      }
-
-      // 5. Evaluate Lateness Policy & Warning
-      const [policyRows] = await conn.execute<RowDataPacket[]>(
-        `SELECT late_grace_minutes, late_deduction_percentage, salary_working_day_divisor 
-         FROM restaurant_policy_versions WHERE id = ?`,
-        [att.policy_version_id]
-      );
-      const policy = policyRows[0];
-      const grace = policy ? Number(policy.late_grace_minutes) : 10;
-      const lateDeductPct = policy ? Number(policy.late_deduction_percentage) : 10;
-      const divisor = policy ? Number(policy.salary_working_day_divisor) : 26;
-
-      const qualifiesLate = maxLateMinutes > grace;
-
-      // Get latest salary version for rate calculation
-      const [salRows] = await conn.execute<RowDataPacket[]>(
-        `SELECT id, monthly_salary FROM employee_salary_versions 
-         WHERE restaurant_id = ? AND employee_id = ? AND effective_from_month <= ? 
-         ORDER BY effective_from_month DESC LIMIT 1`,
-        [restaurantId, att.employee_id, att.payroll_month]
-      );
-      const salaryVersion = salRows[0];
-      const monthlySalary = salaryVersion ? Number(salaryVersion.monthly_salary) : 0;
-      const dailySalary = monthlySalary / divisor;
-      const lateDeductionAmount = qualifiesLate ? new Decimal(dailySalary).times(lateDeductPct).dividedBy(100).toNumber() : 0;
-
-      // Insert or update late_penalties
-      if (salaryVersion) {
-        await conn.execute(
-          `INSERT INTO late_penalties 
-            (restaurant_id, employee_id, attendance_day_id, policy_version_id, salary_version_id, qualifies, late_minutes, daily_salary_basis, deduction_percentage, calculated_amount, source_attendance_version)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-           ON DUPLICATE KEY UPDATE 
-             qualifies = VALUES(qualifies),
-             late_minutes = VALUES(late_minutes),
-             daily_salary_basis = VALUES(daily_salary_basis),
-             deduction_percentage = VALUES(deduction_percentage),
-             calculated_amount = VALUES(calculated_amount),
-             source_attendance_version = VALUES(source_attendance_version)`,
-          [
-            restaurantId,
-            att.employee_id,
-            attendanceDayId,
-            att.policy_version_id,
-            salaryVersion.id,
-            qualifiesLate ? 1 : 0,
-            maxLateMinutes,
-            dailySalary,
-            lateDeductPct,
-            lateDeductionAmount,
-            Number(att.row_version) + 1,
-          ]
-        );
-      }
-
-      // Insert or update automatic warning
-      if (qualifiesLate) {
-        await conn.execute(
-          `INSERT INTO warnings 
-            (restaurant_id, employee_id, origin, automatic_attendance_day_id, incident_date, title, reason, late_minutes, system_qualifies, counts_toward_limit, admin_voided)
-           VALUES (?, ?, 'AUTOMATIC_LATE', ?, ?, 'Late Arrival', ?, ?, 1, 1, 0)
-           ON DUPLICATE KEY UPDATE 
-             late_minutes = VALUES(late_minutes),
-             system_qualifies = 1`,
-          [
-            restaurantId,
-            att.employee_id,
-            attendanceDayId,
-            att.work_date,
-            `Arrived ${maxLateMinutes} minutes late (grace period: ${grace} mins)`,
-            maxLateMinutes,
-          ]
-        );
-      } else {
-        // If not qualifying, set system_qualifies = 0 (preserving any history)
-        await conn.execute(
-          `UPDATE warnings 
-           SET system_qualifies = 0 
-           WHERE restaurant_id = ? AND automatic_attendance_day_id = ?`,
-          [restaurantId, attendanceDayId]
-        );
-      }
-
-      // 6. Handle Hour Debt Source on completed workday with shortfall
-      if (body.status === 'COMPLETED') {
-        const shortfall = Math.max(0, att.required_minutes - totalWorkedMinutes);
-        if (shortfall > 0) {
-          await conn.execute(
-            `INSERT INTO hour_debt_sources 
-              (restaurant_id, employee_id, source_type, attendance_day_id, origin_work_date)
-             VALUES (?, ?, 'ATTENDANCE_SHORTFALL', ?, ?)
-             ON DUPLICATE KEY UPDATE origin_work_date = VALUES(origin_work_date)`,
-            [restaurantId, att.employee_id, attendanceDayId, att.work_date]
-          );
-        } else {
-          // If shortfall is 0 now (e.g. employee worked enough hours or corrected), remove debt source if not waived
-          await conn.execute(
-            `DELETE FROM hour_debt_sources 
-             WHERE restaurant_id = ? AND attendance_day_id = ? 
-               AND id NOT IN (SELECT debt_source_id FROM debt_waivers WHERE restaurant_id = ?)`,
-            [restaurantId, attendanceDayId, restaurantId]
-          );
-        }
-      }
-
-      // 7. Increment payroll source revision
-      await conn.execute(
-        `UPDATE payroll_periods SET source_revision = source_revision + 1 WHERE restaurant_id = ? AND month_start = ?`,
-        [restaurantId, att.payroll_month]
-      );
-
-      // 8. Queue recalculation job
-      const deduplicationHash = Buffer.from(
-        `recalc_${restaurantId}_${att.payroll_month}_${Date.now()}`.padEnd(32, '0').slice(0, 32)
-      );
-      await conn.execute(
-        `INSERT INTO jobs 
-          (restaurant_id, job_type, deduplication_hash, payload, status)
-         VALUES (?, 'PAYROLL_RECALCULATE', ?, ?, 'QUEUED')
-         ON DUPLICATE KEY UPDATE status = 'QUEUED'`,
-        [
-          restaurantId,
-          deduplicationHash,
-          JSON.stringify({ month: att.payroll_month, trigger: 'attendance_update' }),
-        ]
-      );
-
-      // Audit
-      await recordAuditEvent(
-        {
-          restaurantId,
-          actorId,
-          actorKind: req.tenantContext!.accountKind,
-          action: 'UPDATE_ATTENDANCE',
-          entityType: 'ATTENDANCE_DAY',
-          entityId: attendanceDayId,
-          requestId: req.requestId,
-          afterValues: { status: body.status, workedMinutes: totalWorkedMinutes, maxLateMinutes },
-        },
-        conn
-      );
-    });
-
+    if (!/^\d+$/.test(attendanceDayId)) throw new AppError(404, 'ATTENDANCE_NOT_FOUND', 'Attendance day record not found');
+    const result = await saveAttendance(req, { attendanceDayId });
     res.json({
-      data: { message: 'Attendance saved and evaluated successfully' },
+      data: { message: 'Attendance saved and evaluated successfully', ...result },
       meta: { requestId: req.requestId },
     });
   } catch (err) {

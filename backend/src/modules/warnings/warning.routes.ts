@@ -2,7 +2,8 @@ import { Router, type Request, type Response, type NextFunction } from 'express'
 import type { RowDataPacket, ResultSetHeader } from 'mysql2/promise';
 import { DateTime } from 'luxon';
 import { withTransaction, pool } from '../../infrastructure/database/pool.js';
-import { createCustomWarningSchema, voidWarningSchema } from '../../contracts/schemas.js';
+import { createCustomWarningSchema, voidWarningSchema, monthQuerySchema } from '../../contracts/schemas.js';
+import { lockOpenPeriod, bumpSourceRevision } from '../payroll/periodLock.js';
 import { AppError } from '../../middleware/errorHandler.js';
 import { recordAuditEvent } from '../../infrastructure/logging/audit.js';
 
@@ -12,8 +13,18 @@ export const warningRouter = Router({ mergeParams: true });
 warningRouter.get('/', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const restaurantId = req.tenantContext!.restaurantId;
-    const month = (req.query.month as string) || new Date().toISOString().slice(0, 7);
+    const month = monthQuerySchema.parse(req.query.month || new Date().toISOString().slice(0, 7));
     const monthStart = `${month}-01`;
+
+    // Policy effective for this month (latest revision of the latest effective version)
+    const [policyRows] = await pool.execute<RowDataPacket[]>(
+      `SELECT warning_threshold FROM restaurant_policy_versions
+       WHERE restaurant_id = ? AND effective_from_month <= ?
+       ORDER BY effective_from_month DESC, revision_no DESC
+       LIMIT 1`,
+      [restaurantId, monthStart]
+    );
+    const threshold = policyRows[0] ? Number(policyRows[0].warning_threshold) : 3;
 
     const [rows] = await pool.execute<RowDataPacket[]>(
       `SELECT 
@@ -48,10 +59,19 @@ warningRouter.get('/', async (req: Request, res: Response, next: NextFunction) =
       [restaurantId, monthStart, monthStart]
     );
 
-    res.json({
-      data: rows.map((r) => ({
+    const employeeWarningCounts: Record<string, { total: number; counted: number; limitReached: boolean }> = {};
+    for (const r of rows) {
+      const key = String(r.employee_id);
+      const entry = (employeeWarningCounts[key] ??= { total: 0, counted: 0, limitReached: false });
+      entry.total += 1;
+      if (r.system_qualifies && !r.admin_voided && r.counts_toward_limit) entry.counted += 1;
+      entry.limitReached = entry.counted >= threshold;
+    }
+
+    const warnings = rows.map((r) => ({
         id: String(r.id),
         employeeId: String(r.employee_id),
+        fullName: r.employee_name,
         employeeName: r.employee_name,
         employeeNumber: r.employee_number,
         positionName: r.position_name,
@@ -71,7 +91,10 @@ warningRouter.get('/', async (req: Request, res: Response, next: NextFunction) =
         createdByName: r.created_by_name,
         createdAt: r.created_at,
         rowVersion: Number(r.row_version),
-      })),
+      }));
+
+    res.json({
+      data: { threshold, warnings, employeeWarningCounts },
       meta: { requestId: req.requestId },
     });
   } catch (err) {
@@ -79,16 +102,17 @@ warningRouter.get('/', async (req: Request, res: Response, next: NextFunction) =
   }
 });
 
-// POST /api/v1/restaurants/:restaurantId/employees/:employeeId/warnings or /warnings
+// POST /warnings, /warnings/custom or /warnings/employees/:employeeId
 const handleCreateWarning = async (req: Request, res: Response, next: NextFunction) => {
   try {
     const restaurantId = req.tenantContext!.restaurantId;
-    const employeeId = String(req.params.employeeId || req.body.employeeId);
-    if (!employeeId || employeeId === 'undefined') {
+    const rawEmployeeId = req.params.employeeId ?? req.body?.employeeId;
+    if (rawEmployeeId === undefined || rawEmployeeId === null || String(rawEmployeeId).trim() === '') {
       throw new AppError(400, 'EMPLOYEE_ID_REQUIRED', 'Employee ID is required');
     }
+    const employeeId = String(rawEmployeeId);
     const actorId = req.tenantContext!.actorId;
-    const body = createCustomWarningSchema.parse(req.body);
+    const body = createCustomWarningSchema.parse(req.body ?? {});
 
     const monthStart = `${body.incidentDate.slice(0, 7)}-01`;
 
@@ -101,14 +125,8 @@ const handleCreateWarning = async (req: Request, res: Response, next: NextFuncti
       );
       if (!empRows[0]) throw new AppError(404, 'EMPLOYEE_NOT_FOUND', 'Employee not found');
 
-      // Check payroll period is not finalized
-      const [perRows] = await conn.execute<RowDataPacket[]>(
-        `SELECT status FROM payroll_periods WHERE restaurant_id = ? AND month_start = ?`,
-        [restaurantId, monthStart]
-      );
-      if (perRows[0]?.status === 'FINALIZED') {
-        throw new AppError(409, 'PAYROLL_PERIOD_FINALIZED', 'Cannot add warning to a finalized period');
-      }
+      // Lock the payroll period and make sure it is not finalized
+      await lockOpenPeriod(conn, restaurantId, monthStart, 'Cannot add warning to a finalized period', true);
 
       const [resHeader] = await conn.execute<ResultSetHeader>(
         `INSERT INTO warnings 
@@ -126,11 +144,7 @@ const handleCreateWarning = async (req: Request, res: Response, next: NextFuncti
       );
       newWarningId = resHeader.insertId;
 
-      // Increment source_revision
-      await conn.execute(
-        `UPDATE payroll_periods SET source_revision = source_revision + 1 WHERE restaurant_id = ? AND month_start = ?`,
-        [restaurantId, monthStart]
-      );
+      await bumpSourceRevision(conn, restaurantId, monthStart);
 
       await recordAuditEvent(
         {
@@ -157,6 +171,7 @@ const handleCreateWarning = async (req: Request, res: Response, next: NextFuncti
 };
 
 warningRouter.post('/employees/:employeeId', handleCreateWarning);
+warningRouter.post('/custom', handleCreateWarning);
 warningRouter.post('/', handleCreateWarning);
 
 // POST /api/v1/restaurants/:restaurantId/warnings/:warningId/void
@@ -165,47 +180,40 @@ warningRouter.post('/:warningId/void', async (req: Request, res: Response, next:
     const restaurantId = req.tenantContext!.restaurantId;
     const warningId = String(req.params.warningId);
     const actorId = req.tenantContext!.actorId;
-    const body = voidWarningSchema.parse(req.body);
+    const body = voidWarningSchema.parse(req.body ?? {});
 
     await withTransaction(async (conn) => {
       const [wRows] = await conn.execute<RowDataPacket[]>(
-        `SELECT id, incident_date, admin_voided, row_version FROM warnings WHERE restaurant_id = ? AND id = ?`,
+        `SELECT id, DATE_FORMAT(incident_date, '%Y-%m-01') AS month_start, admin_voided, row_version
+         FROM warnings WHERE restaurant_id = ? AND id = ? FOR UPDATE`,
         [restaurantId, warningId]
       );
       const w = wRows[0];
       if (!w) throw new AppError(404, 'WARNING_NOT_FOUND', 'Warning not found');
       if (w.admin_voided) throw new AppError(400, 'ALREADY_VOIDED', 'Warning is already voided');
       if (Number(w.row_version) !== body.expectedVersion) {
-        throw new AppError(412, 'ROW_VERSION_CONFLICT', 'Warning was modified by another administrator');
+        throw new AppError(409, 'ROW_VERSION_CONFLICT', 'Warning was modified by another administrator');
       }
 
-      const monthStart = `${DateTime.fromJSDate(w.incident_date).toISODate()!.slice(0, 7)}-01`;
+      const monthStart = String(w.month_start);
+      await lockOpenPeriod(conn, restaurantId, monthStart, 'Cannot void warning in a finalized month');
 
-      const [perRows] = await conn.execute<RowDataPacket[]>(
-        `SELECT status FROM payroll_periods WHERE restaurant_id = ? AND month_start = ?`,
-        [restaurantId, monthStart]
-      );
-      if (perRows[0]?.status === 'FINALIZED') {
-        throw new AppError(409, 'PAYROLL_PERIOD_FINALIZED', 'Cannot void warning in a finalized month');
-      }
-
-      await conn.execute(
-        `UPDATE warnings 
+      const [upd] = await conn.execute<ResultSetHeader>(
+        `UPDATE warnings
          SET admin_voided = 1,
              void_reason = ?,
              voided_by = ?,
              voided_at = NOW(3),
              row_version = row_version + 1,
              updated_by = ?
-         WHERE restaurant_id = ? AND id = ?`,
-        [body.voidReason, actorId, actorId, restaurantId, warningId]
+         WHERE restaurant_id = ? AND id = ? AND row_version = ?`,
+        [body.voidReason, actorId, actorId, restaurantId, warningId, body.expectedVersion]
       );
+      if (upd.affectedRows !== 1) {
+        throw new AppError(409, 'ROW_VERSION_CONFLICT', 'Warning was modified by another administrator');
+      }
 
-      // Increment source_revision
-      await conn.execute(
-        `UPDATE payroll_periods SET source_revision = source_revision + 1 WHERE restaurant_id = ? AND month_start = ?`,
-        [restaurantId, monthStart]
-      );
+      await bumpSourceRevision(conn, restaurantId, monthStart);
 
       await recordAuditEvent(
         {

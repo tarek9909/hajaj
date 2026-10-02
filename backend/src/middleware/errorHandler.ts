@@ -25,10 +25,12 @@ export const errorHandler = (
 
   // Handle Zod Validation Errors
   if (err instanceof ZodError) {
+    const first = err.issues[0];
+    const where = first?.path?.length ? `${first.path.join('.')}: ` : '';
     res.status(422).json({
       error: {
         code: 'VALIDATION_ERROR',
-        message: 'Invalid request input',
+        message: first ? `${where}${first.message}` : 'Invalid request input',
         details: { issues: err.issues },
       },
       meta: { requestId },
@@ -63,6 +65,15 @@ export const errorHandler = (
       });
       return;
     }
+  }
+
+  // Malformed JSON bodies and oversized payloads are client errors, not 500s
+  if (err && typeof err === 'object' && (err.type === 'entity.parse.failed' || err.type === 'entity.too.large')) {
+    res.status(err.type === 'entity.too.large' ? 413 : 400).json({
+      error: { code: 'BAD_REQUEST', message: err.type === 'entity.too.large' ? 'Request body too large' : 'Malformed JSON body' },
+      meta: { requestId },
+    });
+    return;
   }
 
   console.error(`[${requestId}] Internal Server Error:`, err);

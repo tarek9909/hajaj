@@ -1,6 +1,6 @@
-import React, { useState } from 'react';
-import { NavLink, Outlet, useNavigate, useLocation } from 'react-router-dom';
-import { useAuth } from '../../context/AuthContext';
+import React, { useEffect, useState } from 'react';
+import { NavLink, Outlet, useNavigate, useLocation, useParams } from 'react-router-dom';
+import { useQuery } from '@tanstack/react-query';
 import {
   LayoutDashboard,
   Users,
@@ -16,122 +16,174 @@ import {
   Building2,
   Menu,
   X,
+  type LucideIcon,
 } from 'lucide-react';
+import { useAuth } from '../../context/AuthContext';
+import { platformApi, payrollApi } from '../../lib/api';
+import { usePeriod } from '../../context/PeriodContext';
+import { initials } from '../../lib/format';
+import { useRestaurant } from '../../hooks/useRestaurant';
+import { PeriodPicker, ErrorBoundary } from '../ui';
+
+interface NavItem {
+  label: string;
+  path: string;
+  icon: LucideIcon;
+}
+interface NavGroup {
+  label: string;
+  items: NavItem[];
+}
+
+const PERIOD_SCREENS = ['dashboard', 'scheduling', 'warnings', 'debt', 'adjustments', 'payroll'];
 
 export const AppLayout: React.FC = () => {
-  const { user, logout, activeRestaurantId, setActiveRestaurantId } = useAuth();
+  const { user, logout, setActiveRestaurantId } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
+  const { restaurantId } = useParams<{ restaurantId: string }>();
   const [mobileOpen, setMobileOpen] = useState(false);
 
-  const restaurantId = activeRestaurantId || (user?.restaurantId ?? '1');
   const isPlatformView = location.pathname.startsWith('/platform');
+  const isSuperadmin = user?.accountKind === 'SUPERADMIN';
+  const screen = location.pathname.split('/').filter(Boolean).pop() || '';
+
+  const { restaurant } = useRestaurant();
+
+  const { data: restaurants = [] } = useQuery({
+    queryKey: ['platform-restaurants-switcher'],
+    queryFn: () => platformApi.listRestaurants(),
+    enabled: isSuperadmin,
+    staleTime: 60_000,
+  });
+
+  // First visit: open on the latest month that actually has payroll data instead of an empty calendar month
+  const { hasChosen, setMonth } = usePeriod();
+  const { data: periods } = useQuery({
+    queryKey: ['payroll-periods', restaurantId],
+    queryFn: () => payrollApi.listPeriods(restaurantId!),
+    enabled: Boolean(restaurantId) && !hasChosen && !isPlatformView,
+  });
+  useEffect(() => {
+    if (hasChosen || !periods) return;
+    const latest = periods.find((p) => p.currentCalculationRunId || p.status === 'FINALIZED');
+    if (latest) setMonth(latest.month);
+  }, [hasChosen, periods, setMonth]);
+
+  // Remember which restaurant a superadmin is working in
+  useEffect(() => {
+    if (isSuperadmin && restaurantId) setActiveRestaurantId(restaurantId);
+  }, [isSuperadmin, restaurantId, setActiveRestaurantId]);
+
+  useEffect(() => setMobileOpen(false), [location.pathname]);
+
+  const base = `/restaurants/${restaurantId}`;
+  const groups: NavGroup[] = isPlatformView
+    ? [{ label: 'Platform', items: [{ label: 'Restaurants', path: '/platform', icon: Building2 }] }]
+    : [
+        { label: 'Overview', items: [{ label: 'Dashboard', path: `${base}/dashboard`, icon: LayoutDashboard }] },
+        {
+          label: 'Operations',
+          items: [
+            { label: 'Schedule', path: `${base}/scheduling`, icon: CalendarDays },
+            { label: 'Attendance', path: `${base}/attendance`, icon: Clock },
+          ],
+        },
+        {
+          label: 'People',
+          items: [
+            { label: 'Employees', path: `${base}/employees`, icon: Users },
+            { label: 'Warnings', path: `${base}/warnings`, icon: AlertTriangle },
+          ],
+        },
+        {
+          label: 'Payroll',
+          items: [
+            { label: 'Hour debt', path: `${base}/debt`, icon: Scale },
+            { label: 'Adjustments', path: `${base}/adjustments`, icon: SlidersHorizontal },
+            { label: 'Payroll & reports', path: `${base}/payroll`, icon: FileSpreadsheet },
+          ],
+        },
+        { label: 'Workspace', items: [{ label: 'Settings & policy', path: `${base}/settings`, icon: Settings }] },
+      ];
 
   const handleLogout = async () => {
     await logout();
-    navigate('/login');
+    navigate('/login', { replace: true });
   };
 
-  const navItems = isPlatformView
-    ? [
-        { label: 'All Restaurants', path: '/platform', icon: Building2 },
-        { label: 'Switch to Restaurant', path: `/restaurants/${restaurantId}/dashboard`, icon: LayoutDashboard },
-      ]
-    : [
-        { label: 'Dashboard', path: `/restaurants/${restaurantId}/dashboard`, icon: LayoutDashboard },
-        { label: 'Employees', path: `/restaurants/${restaurantId}/employees`, icon: Users },
-        { label: 'Shift Schedules', path: `/restaurants/${restaurantId}/scheduling`, icon: CalendarDays },
-        { label: 'Daily Attendance', path: `/restaurants/${restaurantId}/attendance`, icon: Clock },
-        { label: 'Warnings & Limits', path: `/restaurants/${restaurantId}/warnings`, icon: AlertTriangle },
-        { label: 'Hour Debt & Waivers', path: `/restaurants/${restaurantId}/debt`, icon: Scale },
-        { label: 'Adjustments', path: `/restaurants/${restaurantId}/adjustments`, icon: SlidersHorizontal },
-        { label: 'Payroll & Reports', path: `/restaurants/${restaurantId}/payroll`, icon: FileSpreadsheet },
-        { label: 'Settings & Policy', path: `/restaurants/${restaurantId}/settings`, icon: Settings },
-      ];
+  const showPeriod = !isPlatformView && PERIOD_SCREENS.includes(screen);
+  const workspaceName = isPlatformView ? 'Platform console' : restaurant?.name ?? user?.restaurantName ?? 'Workspace';
 
   return (
     <div className="app-shell">
-      {/* Sidebar */}
+      <div className={`sidebar-scrim ${mobileOpen ? 'open' : ''}`} onClick={() => setMobileOpen(false)} />
+
       <aside className={`sidebar ${mobileOpen ? 'mobile-open' : ''}`}>
         <div className="sidebar-header">
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', flex: 1, minWidth: 0 }}>
-            <div
-              style={{
-                width: 32,
-                height: 32,
-                borderRadius: 8,
-                backgroundColor: 'var(--primary)',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                color: '#fff',
-                fontWeight: 700,
-                fontSize: 16,
-                flexShrink: 0,
-              }}
-            >
-              W
-            </div>
-            <div style={{ overflow: 'hidden' }}>
-              <div style={{ fontWeight: 700, fontSize: '0.95rem', color: '#fff', letterSpacing: '-0.02em' }}>
-                WorkforceOS
-              </div>
-              <div style={{ fontSize: '0.72rem', color: 'var(--nav-text-muted)', textOverflow: 'ellipsis', overflow: 'hidden', whiteSpace: 'nowrap' }}>
-                {isPlatformView ? 'Platform Control' : (restaurantId === '1' ? 'The Grand Bistro' : (restaurantId === '2' ? 'Spice Garden' : `Restaurant #${restaurantId}`))}
-              </div>
-            </div>
+          <div className="brand-mark">W</div>
+          <div style={{ minWidth: 0, flex: 1 }}>
+            <div className="brand-name">WorkforceOS</div>
+            <div className="brand-sub">{workspaceName}</div>
           </div>
           <button
+            className="btn btn-ghost btn-icon mobile-only"
             onClick={() => setMobileOpen(false)}
-            style={{ display: mobileOpen ? 'block' : 'none', background: 'none', border: 'none', color: '#94a3b8', cursor: 'pointer' }}
+            aria-label="Close menu"
+            style={{ color: 'var(--nav-text-muted)' }}
           >
-            <X size={20} />
+            <X size={18} />
           </button>
         </div>
 
         <nav className="sidebar-nav">
-          {navItems.map((item) => (
-            <NavLink
-              key={item.path}
-              to={item.path}
-              onClick={() => setMobileOpen(false)}
-              className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}
-            >
-              <item.icon size={18} />
-              <span>{item.label}</span>
-            </NavLink>
+          {groups.map((group) => (
+            <div className="nav-group" key={group.label}>
+              <div className="nav-group-label">{group.label}</div>
+              {group.items.map((item) => (
+                <NavLink
+                  key={item.path}
+                  to={item.path}
+                  end={item.path === '/platform'}
+                  className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}
+                >
+                  <item.icon size={17} />
+                  <span>{item.label}</span>
+                </NavLink>
+              ))}
+            </div>
           ))}
 
-          {user?.accountKind === 'SUPERADMIN' && !isPlatformView && (
-            <div style={{ marginTop: 'auto', paddingTop: '1rem', borderTop: '1px solid var(--nav-border)' }}>
-              <NavLink
-                to="/platform"
-                onClick={() => setMobileOpen(false)}
-                className="nav-item"
-                style={{ color: '#38bdf8' }}
-              >
-                <ShieldCheck size={18} />
-                <span>Superadmin Console</span>
+          {isSuperadmin && (
+            <div className="nav-group" style={{ marginTop: 'auto' }}>
+              <div className="nav-group-label">Superadmin</div>
+              <NavLink to="/platform" end className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
+                <ShieldCheck size={17} />
+                <span>Platform console</span>
               </NavLink>
             </div>
           )}
         </nav>
 
         <div className="sidebar-footer">
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.5rem' }}>
-            <div style={{ minWidth: 0 }}>
+          <div className="row" style={{ gap: '0.65rem' }}>
+            <div className="avatar" style={{ background: 'var(--nav-surface)', color: '#7ee8d3' }}>
+              {initials(user?.fullName)}
+            </div>
+            <div style={{ minWidth: 0, flex: 1 }}>
               <div style={{ fontWeight: 600, fontSize: '0.8125rem', color: '#fff', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
                 {user?.fullName || 'User'}
               </div>
               <div style={{ fontSize: '0.7rem', color: 'var(--nav-text-muted)' }}>
-                {user?.accountKind === 'SUPERADMIN' ? 'Platform Superadmin' : 'Restaurant Admin'}
+                {isSuperadmin ? 'Platform superadmin' : 'Restaurant admin'}
               </div>
             </div>
             <button
               onClick={handleLogout}
-              className="btn btn-secondary btn-sm"
+              className="btn btn-ghost btn-icon"
               title="Sign out"
-              style={{ padding: '0.35rem', background: 'transparent', borderColor: 'var(--nav-border)', color: '#94a3b8' }}
+              aria-label="Sign out"
+              style={{ color: 'var(--nav-text-muted)' }}
             >
               <LogOut size={16} />
             </button>
@@ -139,48 +191,47 @@ export const AppLayout: React.FC = () => {
         </div>
       </aside>
 
-      {/* Main Content Area */}
       <div className="main-content">
-        {/* Topbar */}
         <header className="topbar">
-          <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
-            <button
-              onClick={() => setMobileOpen(true)}
-              style={{ display: 'flex', alignItems: 'center', background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-main)' }}
-              className="mobile-only"
-            >
-              <Menu size={22} />
+          <div className="row">
+            <button className="btn btn-ghost btn-icon mobile-only" onClick={() => setMobileOpen(true)} aria-label="Open menu">
+              <Menu size={20} />
             </button>
 
-            {user?.accountKind === 'SUPERADMIN' && (
-              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                <span style={{ fontSize: '0.8125rem', color: 'var(--text-muted)' }}>Active Workspace:</span>
-                <select
-                  value={restaurantId}
-                  onChange={(e) => {
-                    setActiveRestaurantId(e.target.value);
-                    navigate(`/restaurants/${e.target.value}/dashboard`);
-                  }}
-                  className="select"
-                  style={{ width: 'auto', padding: '0.3rem 0.6rem', fontSize: '0.8125rem' }}
-                >
-                  <option value="1">The Grand Bistro (USD)</option>
-                  <option value="2">Spice Garden (SAR)</option>
-                </select>
-              </div>
+            {isSuperadmin && !isPlatformView ? (
+              <select
+                value={restaurantId}
+                onChange={(e) => navigate(`/restaurants/${e.target.value}/${screen || 'dashboard'}`)}
+                className="select"
+                aria-label="Active restaurant"
+                style={{ width: 'auto', minWidth: 200, fontWeight: 600 }}
+              >
+                {restaurants.length === 0 && <option value={restaurantId}>{restaurant?.name ?? 'Restaurant'}</option>}
+                {restaurants.map((r) => (
+                  <option key={r.id} value={r.id}>
+                    {r.name} · {r.currencyCode}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <span style={{ fontWeight: 600, fontSize: '0.9rem' }}>{isPlatformView ? 'All restaurants' : workspaceName}</span>
             )}
           </div>
 
-          <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
-            <span className={`badge ${user?.accountKind === 'SUPERADMIN' ? 'badge-info' : 'badge-neutral'}`}>
-              {user?.accountKind === 'SUPERADMIN' ? 'Superadmin' : 'Tenant Admin'}
-            </span>
+          <div className="row">
+            {showPeriod && <PeriodPicker />}
+            {restaurant && !isPlatformView && (
+              <span className="badge badge-neutral hide-sm" title="Restaurant timezone and currency">
+                {restaurant.timezone} · {restaurant.currencyCode}
+              </span>
+            )}
           </div>
         </header>
 
-        {/* Page Content */}
         <main className="page-container">
-          <Outlet />
+          <ErrorBoundary key={location.pathname}>
+            <Outlet />
+          </ErrorBoundary>
         </main>
       </div>
     </div>

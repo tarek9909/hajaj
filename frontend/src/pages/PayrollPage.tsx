@@ -1,7 +1,8 @@
+import { usePeriod } from '../context/PeriodContext';
 import React, { useState } from 'react';
 import { useParams } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { payrollApi, platformApi } from '../lib/api';
+import { payrollApi, restaurantApi } from '../lib/api';
 import {
   Calculator,
   Lock,
@@ -17,10 +18,10 @@ import {
 } from 'lucide-react';
 
 export const PayrollPage: React.FC = () => {
-  const { restaurantId = '1' } = useParams<{ restaurantId: string }>();
+  const { restaurantId = '' } = useParams<{ restaurantId: string }>();
   const queryClient = useQueryClient();
 
-  const [selectedMonth, setSelectedMonth] = useState('2026-09');
+  const { month: selectedMonth } = usePeriod();
   const [expandedRows, setExpandedRows] = useState<Record<string, boolean>>({});
   const [showReopenModal, setShowReopenModal] = useState(false);
   const [reopenReason, setReopenReason] = useState('');
@@ -28,7 +29,7 @@ export const PayrollPage: React.FC = () => {
 
   const { data: restaurant } = useQuery({
     queryKey: ['restaurant-info', restaurantId],
-    queryFn: () => platformApi.getRestaurant(restaurantId),
+    queryFn: () => restaurantApi.getProfile(restaurantId),
   });
 
   const { data: payrollData, isLoading, refetch } = useQuery({
@@ -94,11 +95,11 @@ export const PayrollPage: React.FC = () => {
   return (
     <div>
       {/* Header Bar */}
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '1.75rem', flexWrap: 'wrap', gap: '1rem' }}>
+      <div className="page-header">
         <div>
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
-            <h1 style={{ fontSize: '1.75rem', fontWeight: 700, letterSpacing: '-0.02em' }}>
-              Payroll & Reporting Command
+            <h1 className="page-title">
+              Payroll
             </h1>
             <span
               className={`badge ${
@@ -122,21 +123,13 @@ export const PayrollPage: React.FC = () => {
               )}
             </span>
           </div>
-          <p style={{ color: 'var(--text-muted)', fontSize: '0.875rem', marginTop: '0.25rem' }}>
+          <p className="page-subtitle">
             Authoritative financial calculations, immutable snapshot history, and Excel payroll exports.
           </p>
         </div>
 
         {/* Action Buttons */}
         <div style={{ display: 'flex', gap: '0.6rem', alignItems: 'center', flexWrap: 'wrap' }}>
-          <input
-            type="month"
-            className="input mono"
-            value={selectedMonth}
-            onChange={(e) => setSelectedMonth(e.target.value)}
-            style={{ width: 'auto', padding: '0.4rem 0.75rem' }}
-          />
-
           <button
             className="btn btn-secondary"
             onClick={() => refetch()}
@@ -170,7 +163,7 @@ export const PayrollPage: React.FC = () => {
           ) : (
             <button
               className="btn btn-secondary"
-              style={{ color: '#b45309' }}
+              style={{ color: 'var(--status-warning)' }}
               onClick={() => {
                 setActionError(null);
                 setReopenReason('');
@@ -205,7 +198,7 @@ export const PayrollPage: React.FC = () => {
             backgroundColor: 'var(--status-danger-bg)',
             border: '1px solid var(--status-danger-border)',
             borderRadius: 'var(--radius-lg)',
-            color: '#991b1b',
+            color: 'var(--status-danger-text)',
             fontSize: '0.875rem',
             marginBottom: '1.5rem',
           }}
@@ -223,10 +216,10 @@ export const PayrollPage: React.FC = () => {
             alignItems: 'center',
             gap: '0.5rem',
             padding: '0.75rem 1.25rem',
-            backgroundColor: '#f0fdf4',
-            border: '1px solid #bbf7d0',
+            backgroundColor: 'var(--status-success-bg)',
+            border: '1px solid var(--status-success-border)',
             borderRadius: 'var(--radius-lg)',
-            color: '#15803d',
+            color: 'var(--status-success)',
             fontSize: '0.8125rem',
             marginBottom: '1.5rem',
           }}
@@ -244,17 +237,17 @@ export const PayrollPage: React.FC = () => {
         <div
           style={{
             padding: '1rem 1.25rem',
-            backgroundColor: '#fef2f2',
-            border: '1px solid #fecaca',
+            backgroundColor: 'var(--status-danger-bg)',
+            border: '1px solid var(--status-danger-border)',
             borderRadius: 'var(--radius-lg)',
             marginBottom: '1.5rem',
           }}
         >
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontWeight: 700, color: '#991b1b', fontSize: '0.9rem' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontWeight: 700, color: 'var(--status-danger-text)', fontSize: '0.9rem' }}>
             <AlertTriangle size={18} />
             <span>Finalization Blocked ({blockersCount} issues detected)</span>
           </div>
-          <ul style={{ paddingLeft: '1.5rem', marginTop: '0.5rem', fontSize: '0.8125rem', color: '#7f1d1d' }}>
+          <ul style={{ paddingLeft: '1.5rem', marginTop: '0.5rem', fontSize: '0.8125rem', color: 'var(--status-danger-text)' }}>
             {blockersData?.affectedEmployees.map((ae) => (
               <li key={ae.employeeId}>
                 <strong>{ae.fullName}:</strong> {ae.blockers.join('; ')}
@@ -278,7 +271,7 @@ export const PayrollPage: React.FC = () => {
 
         <div className="card">
           <span style={{ fontSize: '0.8125rem', fontWeight: 600, color: 'var(--text-muted)' }}>Eligible Overtime Pay</span>
-          <div className="tabular-nums" style={{ fontSize: '1.75rem', fontWeight: 700, color: '#16a34a', marginTop: '0.35rem' }}>
+          <div className="tabular-nums" style={{ fontSize: '1.75rem', fontWeight: 700, color: 'var(--status-success)', marginTop: '0.35rem' }}>
             +{currency} {Number(summary?.totalOvertimePay || 0).toFixed(decimals)}
           </div>
           <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', marginTop: '0.25rem' }}>
@@ -288,7 +281,7 @@ export const PayrollPage: React.FC = () => {
 
         <div className="card">
           <span style={{ fontSize: '0.8125rem', fontWeight: 600, color: 'var(--text-muted)' }}>Total Deductions</span>
-          <div className="tabular-nums" style={{ fontSize: '1.75rem', fontWeight: 700, color: '#dc2626', marginTop: '0.35rem' }}>
+          <div className="tabular-nums" style={{ fontSize: '1.75rem', fontWeight: 700, color: 'var(--status-danger)', marginTop: '0.35rem' }}>
             -{currency} {(Number(summary?.totalLateDeductions || 0) + Number(summary?.totalOtherDeductions || 0)).toFixed(decimals)}
           </div>
           <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', marginTop: '0.25rem' }}>
@@ -297,7 +290,7 @@ export const PayrollPage: React.FC = () => {
           </div>
         </div>
 
-        <div className="card" style={{ borderColor: 'var(--primary)', backgroundColor: '#f0fdfa' }}>
+        <div className="card" style={{ borderColor: 'var(--primary)', backgroundColor: 'var(--primary-soft)' }}>
           <span style={{ fontSize: '0.8125rem', fontWeight: 700, color: 'var(--primary)' }}>Net Payable Payroll</span>
           <div className="tabular-nums" style={{ fontSize: '1.75rem', fontWeight: 800, color: 'var(--primary)', marginTop: '0.35rem' }}>
             {currency} {Number(summary?.totalNetPayable || 0).toFixed(decimals)}
@@ -369,7 +362,7 @@ export const PayrollPage: React.FC = () => {
                           {currency} {Number(emp.contractualMonthlySalary).toFixed(decimals)}
                         </td>
                         <td>
-                          <div className="tabular-nums mono" style={{ fontWeight: 600, color: Number(emp.overtimeAmount) > 0 ? '#16a34a' : 'var(--text-muted)' }}>
+                          <div className="tabular-nums mono" style={{ fontWeight: 600, color: Number(emp.overtimeAmount) > 0 ? 'var(--status-success)' : 'var(--text-muted)' }}>
                             +{currency} {Number(emp.overtimeAmount).toFixed(decimals)}
                           </div>
                           {Number(emp.eligibleOvertimeMinutes) > 0 && (
@@ -379,7 +372,7 @@ export const PayrollPage: React.FC = () => {
                           )}
                         </td>
                         <td>
-                          <div className="tabular-nums mono" style={{ color: Number(emp.lateDeductionAmount) > 0 ? '#dc2626' : 'var(--text-muted)' }}>
+                          <div className="tabular-nums mono" style={{ color: Number(emp.lateDeductionAmount) > 0 ? 'var(--status-danger)' : 'var(--text-muted)' }}>
                             {Number(emp.lateDeductionAmount) > 0 ? `-${currency} ${Number(emp.lateDeductionAmount).toFixed(decimals)}` : '-'}
                           </div>
                           {emp.lateIncidentCount > 0 && (
@@ -389,7 +382,7 @@ export const PayrollPage: React.FC = () => {
                           )}
                         </td>
                         <td>
-                          <div className="tabular-nums mono" style={{ color: Number(emp.otherDeductionAmount) > 0 ? '#dc2626' : 'var(--text-muted)' }}>
+                          <div className="tabular-nums mono" style={{ color: Number(emp.otherDeductionAmount) > 0 ? 'var(--status-danger)' : 'var(--text-muted)' }}>
                             {Number(emp.otherDeductionAmount) > 0 ? `-${currency} ${Number(emp.otherDeductionAmount).toFixed(decimals)}` : '-'}
                           </div>
                         </td>
@@ -400,7 +393,7 @@ export const PayrollPage: React.FC = () => {
                               fontSize: '1rem',
                               fontWeight: 800,
                               color: 'var(--primary)',
-                              backgroundColor: '#f0fdfa',
+                              backgroundColor: 'var(--primary-soft)',
                               padding: '0.2rem 0.5rem',
                               borderRadius: 4,
                               display: 'inline-block',
@@ -470,7 +463,7 @@ export const PayrollPage: React.FC = () => {
                                 </div>
                                 <div>
                                   <span style={{ color: 'var(--text-muted)' }}>Waived Minutes: </span>
-                                  <strong style={{ color: '#16a34a' }}>{emp.waivedMinutes || 0} mins</strong>
+                                  <strong style={{ color: 'var(--status-success)' }}>{emp.waivedMinutes || 0} mins</strong>
                                 </div>
                                 <div>
                                   <span style={{ color: 'var(--text-muted)' }}>Debt Recovered: </span>
@@ -478,7 +471,7 @@ export const PayrollPage: React.FC = () => {
                                 </div>
                                 <div>
                                   <span style={{ color: 'var(--text-muted)' }}>Closing Debt: </span>
-                                  <strong style={{ color: Number(emp.closingDebtMinutes || 0) > 0 ? '#b45309' : '#16a34a' }}>
+                                  <strong style={{ color: Number(emp.closingDebtMinutes || 0) > 0 ? 'var(--status-warning)' : 'var(--status-success)' }}>
                                     {emp.closingDebtMinutes || 0} mins
                                   </strong>
                                 </div>
@@ -506,7 +499,7 @@ export const PayrollPage: React.FC = () => {
                                           <td className="tabular-nums">{ln.quantity}</td>
                                           <td>{ln.unit}</td>
                                           <td className="tabular-nums mono">{currency} {Number(ln.rateSnapshot).toFixed(decimals)}</td>
-                                          <td className="tabular-nums mono" style={{ textAlign: 'right', fontWeight: 700, color: Number(ln.signedAmount) >= 0 ? '#16a34a' : '#dc2626' }}>
+                                          <td className="tabular-nums mono" style={{ textAlign: 'right', fontWeight: 700, color: Number(ln.signedAmount) >= 0 ? 'var(--status-success)' : 'var(--status-danger)' }}>
                                             {Number(ln.signedAmount) >= 0 ? '+' : ''}{currency} {Number(ln.signedAmount).toFixed(decimals)}
                                           </td>
                                         </tr>
@@ -546,7 +539,7 @@ export const PayrollPage: React.FC = () => {
                   backgroundColor: 'var(--status-danger-bg)',
                   border: '1px solid var(--status-danger-border)',
                   borderRadius: 'var(--radius-md)',
-                  color: '#991b1b',
+                  color: 'var(--status-danger-text)',
                   fontSize: '0.8125rem',
                   marginBottom: '1rem',
                 }}
@@ -569,7 +562,7 @@ export const PayrollPage: React.FC = () => {
                   backgroundColor: 'var(--status-warning-bg)',
                   border: '1px solid var(--status-warning-border)',
                   borderRadius: 'var(--radius-md)',
-                  color: '#78350f',
+                  color: 'var(--status-warning-text)',
                   fontSize: '0.8125rem',
                   marginBottom: '1rem',
                 }}

@@ -1,7 +1,7 @@
 import { Router, type Request, type Response, type NextFunction } from 'express';
 import type { RowDataPacket, ResultSetHeader } from 'mysql2/promise';
 import { withTransaction, pool } from '../../infrastructure/database/pool.js';
-import { hashPassword } from '../../infrastructure/auth/passwords.js';
+import { insertRestaurantAdmin } from '../../infrastructure/email/accountLinks.js';
 import { SessionManager } from '../../infrastructure/sessions/sessionManager.js';
 import { recordAuditEvent } from '../../infrastructure/logging/audit.js';
 import { createAdministratorSchema, updateAdministratorSchema } from '../../contracts/schemas.js';
@@ -59,30 +59,45 @@ adminManagementRouter.post('/', async (req: Request, res: Response, next: NextFu
     const body = createAdministratorSchema.parse(req.body);
 
     const emailNorm = body.email.toLowerCase().trim();
-    const password = body.password || 'RestaurantAdmin123!';
-    const passwordHash = await hashPassword(password);
 
-    const [insertRes] = await pool.execute<ResultSetHeader>(
-      `INSERT INTO admin_accounts 
-        (restaurant_id, account_kind, full_name, email_normalized, mobile, password_hash, password_setup_required, status, created_by)
-       VALUES (?, 'RESTAURANT_ADMIN', ?, ?, ?, ?, 0, 'ACTIVE', ?)`,
-      [restaurantId, body.fullName, emailNorm, body.mobile || null, passwordHash, actorId]
-    );
+    const result = await withTransaction(async (conn) => {
+      const [restRows] = await conn.execute<RowDataPacket[]>(`SELECT id FROM restaurants WHERE id = ? FOR UPDATE`, [
+        restaurantId,
+      ]);
+      if (!restRows[0]) {
+        throw new AppError(404, 'RESTAURANT_NOT_FOUND', 'Restaurant not found');
+      }
 
-    await recordAuditEvent({
-      restaurantId,
-      actorId,
-      actorKind: req.tenantContext!.accountKind,
-      action: 'ADD_ADMINISTRATOR',
-      entityType: 'ADMIN_ACCOUNT',
-      entityId: String(insertRes.insertId),
-      requestId: req.requestId,
-      afterValues: { fullName: body.fullName, email: emailNorm },
+      const admin = await insertRestaurantAdmin(conn, {
+        restaurantId,
+        fullName: body.fullName,
+        email: emailNorm,
+        mobile: body.mobile,
+        password: body.password,
+        actorId,
+      });
+
+      await recordAuditEvent(
+        {
+          restaurantId,
+          actorId,
+          actorKind: req.tenantContext!.accountKind,
+          action: 'ADD_ADMINISTRATOR',
+          entityType: 'ADMIN_ACCOUNT',
+          entityId: String(admin.adminId),
+          requestId: req.requestId,
+          afterValues: { fullName: body.fullName, email: emailNorm },
+        },
+        conn
+      );
+      return admin;
     });
 
     res.status(201).json({
       data: {
-        adminId: String(insertRes.insertId),
+        id: String(result.adminId),
+        adminId: String(result.adminId),
+        ...(result.setupToken ? { setupToken: result.setupToken, setupPath: result.setupPath } : {}),
         message: 'Administrator added successfully',
       },
       meta: { requestId: req.requestId },
@@ -100,36 +115,47 @@ adminManagementRouter.patch('/:administratorId', async (req: Request, res: Respo
     const body = updateAdministratorSchema.parse(req.body);
     const actorId = req.tenantContext!.actorId;
 
-    const [updateRes] = await pool.execute<ResultSetHeader>(
-      `UPDATE admin_accounts 
-       SET full_name = COALESCE(?, full_name),
-           mobile = COALESCE(?, mobile),
-           row_version = row_version + 1,
-           updated_by = ?
-       WHERE restaurant_id = ? AND id = ? AND row_version = ?`,
-      [
-        body.fullName || null,
-        body.mobile !== undefined ? body.mobile : null,
-        actorId,
-        restaurantId,
-        administratorId,
-        body.expectedVersion,
-      ]
-    );
+    await withTransaction(async (conn) => {
+      const [updateRes] = await conn.execute<ResultSetHeader>(
+        `UPDATE admin_accounts
+         SET full_name = COALESCE(?, full_name),
+             mobile = IF(?, ?, mobile),
+             row_version = row_version + 1,
+             updated_by = ?
+         WHERE restaurant_id = ? AND id = ? AND row_version = ?`,
+        [
+          body.fullName || null,
+          body.mobile !== undefined ? 1 : 0,
+          body.mobile || null,
+          actorId,
+          restaurantId,
+          administratorId,
+          body.expectedVersion,
+        ]
+      );
 
-    if (updateRes.affectedRows === 0) {
-      throw new AppError(412, 'ROW_VERSION_CONFLICT', 'Record was modified by another administrator');
-    }
+      if (updateRes.affectedRows === 0) {
+        const [exists] = await conn.execute<RowDataPacket[]>(
+          `SELECT id FROM admin_accounts WHERE restaurant_id = ? AND id = ?`,
+          [restaurantId, administratorId]
+        );
+        if (!exists[0]) throw new AppError(404, 'ADMINISTRATOR_NOT_FOUND', 'Administrator not found');
+        throw new AppError(412, 'ROW_VERSION_CONFLICT', 'Record was modified by another administrator');
+      }
 
-    await recordAuditEvent({
-      restaurantId,
-      actorId,
-      actorKind: req.tenantContext!.accountKind,
-      action: 'UPDATE_ADMINISTRATOR',
-      entityType: 'ADMIN_ACCOUNT',
-      entityId: administratorId,
-      requestId: req.requestId,
-      afterValues: body,
+      await recordAuditEvent(
+        {
+          restaurantId,
+          actorId,
+          actorKind: req.tenantContext!.accountKind,
+          action: 'UPDATE_ADMINISTRATOR',
+          entityType: 'ADMIN_ACCOUNT',
+          entityId: administratorId,
+          requestId: req.requestId,
+          afterValues: body,
+        },
+        conn
+      );
     });
 
     res.json({

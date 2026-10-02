@@ -2,9 +2,11 @@ import React from 'react';
 import { BrowserRouter, Routes, Route, Navigate, useParams } from 'react-router-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { AuthProvider, useAuth } from './context/AuthContext';
+import { PeriodProvider } from './context/PeriodContext';
 import { AppLayout } from './components/layout/AppLayout';
 
 import { LoginPage } from './pages/LoginPage';
+import { AccountTokenPage } from './pages/AccountTokenPage';
 import { PlatformDashboardPage } from './pages/PlatformDashboardPage';
 import { RestaurantDashboardPage } from './pages/RestaurantDashboardPage';
 import { EmployeesPage } from './pages/EmployeesPage';
@@ -20,92 +22,67 @@ const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
       refetchOnWindowFocus: false,
-      retry: 1,
-      staleTime: 1000 * 30, // 30 seconds
+      retry: (count, err: any) => (err?.status && err.status < 500 ? false : count < 1),
+      staleTime: 1000 * 30,
     },
   },
 });
 
 const LoadingScreen: React.FC = () => (
-  <div
-    style={{
-      minHeight: '100vh',
-      display: 'flex',
-      flexDirection: 'column',
-      alignItems: 'center',
-      justifyContent: 'center',
-      backgroundColor: 'var(--bg-app)',
-      gap: '1rem',
-    }}
-  >
-    <div
-      style={{
-        width: '40px',
-        height: '40px',
-        border: '3px solid var(--border-color)',
-        borderTopColor: 'var(--primary)',
-        borderRadius: '50%',
-        animation: 'spin 0.8s linear infinite',
-      }}
-    />
-    <div style={{ color: 'var(--text-muted)', fontSize: '0.875rem' }}>Loading WorkforceOS...</div>
+  <div style={{ minHeight: '100vh', display: 'grid', placeItems: 'center', background: 'var(--bg-app)' }}>
+    <div className="row" style={{ color: 'var(--text-muted)', fontSize: '0.875rem' }}>
+      <span className="spinner" />
+      <span>Loading WorkforceOS…</span>
+    </div>
   </div>
 );
+
+/** Where a signed-in user belongs when they hit "/" or an unknown path. */
+function homeFor(user: { accountKind: string; restaurantId: string | null }): string {
+  if (user.accountKind === 'SUPERADMIN') return '/platform';
+  return user.restaurantId ? `/restaurants/${user.restaurantId}/dashboard` : '/login';
+}
 
 const ProtectedRoute: React.FC<{ children: React.ReactElement; requiredRole?: 'SUPERADMIN' }> = ({
   children,
   requiredRole,
 }) => {
   const { user, isLoading } = useAuth();
-
-  if (isLoading) {
-    return <LoadingScreen />;
-  }
-
-  if (!user) {
-    return <Navigate to="/login" replace />;
-  }
-
+  if (isLoading) return <LoadingScreen />;
+  if (!user) return <Navigate to="/login" replace />;
   if (requiredRole === 'SUPERADMIN' && user.accountKind !== 'SUPERADMIN') {
-    return <Navigate to={`/restaurants/${user.restaurantId}/dashboard`} replace />;
+    return <Navigate to={homeFor(user)} replace />;
   }
-
   return children;
 };
 
-// Tenant guard to prevent Restaurant Admins from accessing other restaurants
+// Restaurant admins may only ever see their own restaurant
 const TenantGuard: React.FC<{ children: React.ReactElement }> = ({ children }) => {
   const { user } = useAuth();
   const { restaurantId } = useParams<{ restaurantId: string }>();
-
   if (user?.accountKind === 'RESTAURANT_ADMIN' && user.restaurantId !== restaurantId) {
-    return <Navigate to={`/restaurants/${user.restaurantId}/dashboard`} replace />;
+    return <Navigate to={homeFor(user)} replace />;
   }
-
   return children;
 };
 
 const DefaultRedirect: React.FC = () => {
   const { user, isLoading } = useAuth();
-
   if (isLoading) return <LoadingScreen />;
-
   if (!user) return <Navigate to="/login" replace />;
-
-  if (user.accountKind === 'SUPERADMIN') {
-    return <Navigate to="/platform" replace />;
-  }
-
-  return <Navigate to={`/restaurants/${user.restaurantId || '1'}/dashboard`} replace />;
+  return <Navigate to={homeFor(user)} replace />;
 };
 
-export const App: React.FC = () => {
-  return (
-    <QueryClientProvider client={queryClient}>
-      <AuthProvider>
+export const App: React.FC = () => (
+  <QueryClientProvider client={queryClient}>
+    <AuthProvider>
+      <PeriodProvider>
         <BrowserRouter>
           <Routes>
             <Route path="/login" element={<LoginPage />} />
+            <Route path="/forgot-password" element={<AccountTokenPage mode="forgot" />} />
+            <Route path="/reset-password" element={<AccountTokenPage mode="reset" />} />
+            <Route path="/setup-password" element={<AccountTokenPage mode="setup" />} />
 
             <Route
               path="/platform"
@@ -144,7 +121,7 @@ export const App: React.FC = () => {
             <Route path="*" element={<DefaultRedirect />} />
           </Routes>
         </BrowserRouter>
-      </AuthProvider>
-    </QueryClientProvider>
-  );
-};
+      </PeriodProvider>
+    </AuthProvider>
+  </QueryClientProvider>
+);

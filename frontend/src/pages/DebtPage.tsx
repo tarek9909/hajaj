@@ -1,3 +1,5 @@
+import { usePeriod } from '../context/PeriodContext';
+import { currentMonth } from '../lib/format';
 import React, { useState } from 'react';
 import { useParams } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
@@ -11,10 +13,10 @@ import {
 } from 'lucide-react';
 
 export const DebtPage: React.FC = () => {
-  const { restaurantId = '1' } = useParams<{ restaurantId: string }>();
+  const { restaurantId = '' } = useParams<{ restaurantId: string }>();
   const queryClient = useQueryClient();
 
-  const [selectedMonth, setSelectedMonth] = useState('2026-09');
+  const { month: selectedMonth } = usePeriod();
   const [showWaiverModal, setShowWaiverModal] = useState(false);
   const [voidingWaiver, setVoidingWaiver] = useState<any | null>(null);
   const [voidReason, setVoidReason] = useState('');
@@ -24,7 +26,7 @@ export const DebtPage: React.FC = () => {
   const [waiverForm, setWaiverForm] = useState({
     employeeId: '',
     debtSourceId: '',
-    effectiveMonth: '2026-09-01',
+    effectiveMonth: `${currentMonth()}-01`,
     minutes: 60,
     reason: '',
   });
@@ -48,7 +50,7 @@ export const DebtPage: React.FC = () => {
       setWaiverForm({
         employeeId: '',
         debtSourceId: '',
-        effectiveMonth: '2026-09-01',
+        effectiveMonth: `${currentMonth()}-01`,
         minutes: 60,
         reason: '',
       });
@@ -82,26 +84,17 @@ export const DebtPage: React.FC = () => {
 
   return (
     <div>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '1.75rem', flexWrap: 'wrap', gap: '1rem' }}>
+      <div className="page-header">
         <div>
-          <h1 style={{ fontSize: '1.75rem', fontWeight: 700, letterSpacing: '-0.02em' }}>
-            Working-Hour Debt & Waivers Ledger
+          <h1 className="page-title">
+            Hour debt
           </h1>
-          <p style={{ color: 'var(--text-muted)', fontSize: '0.875rem', marginTop: '0.25rem' }}>
+          <p className="page-subtitle">
             Authoritative tracking of attendance shortfall lots, debt recovery, and official administrative waivers.
           </p>
         </div>
 
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
-          <select
-            value={selectedMonth}
-            onChange={(e) => setSelectedMonth(e.target.value)}
-            className="select"
-            style={{ width: 'auto' }}
-          >
-            <option value="2026-09">September 2026 (Open)</option>
-            <option value="2026-08">August 2026 (Finalized)</option>
-          </select>
           <button className="btn btn-primary" onClick={() => { setModalError(null); setShowWaiverModal(true); }}>
             <Plus size={16} />
             <span>Grant Debt Waiver</span>
@@ -116,8 +109,8 @@ export const DebtPage: React.FC = () => {
           flexDirection: 'column',
           gap: '0.75rem',
           padding: '1.25rem 1.5rem',
-          backgroundColor: '#f8fafc',
-          border: '1px solid #cbd5e1',
+          backgroundColor: 'var(--bg-surface-subtle)',
+          border: '1px solid var(--border-strong)',
           borderRadius: 'var(--radius-lg)',
           marginBottom: '2rem',
         }}
@@ -135,7 +128,7 @@ export const DebtPage: React.FC = () => {
             gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
             gap: '1rem',
             paddingTop: '0.5rem',
-            borderTop: '1px solid #e2e8f0',
+            borderTop: '1px solid var(--border-light)',
           }}
         >
           <div style={{ fontSize: '0.78rem' }}>
@@ -152,7 +145,7 @@ export const DebtPage: React.FC = () => {
           </div>
           <div style={{ fontSize: '0.78rem' }}>
             <span style={{ fontWeight: 600, color: 'var(--text-main)' }}>3. Closing Balance:</span>
-            <div className="mono" style={{ color: '#b45309', marginTop: 2 }}>
+            <div className="mono" style={{ color: 'var(--status-warning)', marginTop: 2 }}>
               Debt Available - Recovered Minutes
             </div>
           </div>
@@ -214,10 +207,10 @@ export const DebtPage: React.FC = () => {
                       <td className="tabular-nums mono" style={{ fontWeight: 600 }}>
                         {grossMins} mins
                       </td>
-                      <td className="tabular-nums mono" style={{ color: waivedMins > 0 ? '#15803d' : 'var(--text-muted)' }}>
+                      <td className="tabular-nums mono" style={{ color: waivedMins > 0 ? 'var(--status-success)' : 'var(--text-muted)' }}>
                         {waivedMins} mins
                       </td>
-                      <td className="tabular-nums mono" style={{ fontWeight: 700, color: netDebt > 0 ? '#b45309' : '#15803d' }}>
+                      <td className="tabular-nums mono" style={{ fontWeight: 700, color: netDebt > 0 ? 'var(--status-warning)' : 'var(--status-success)' }}>
                         {netDebt} mins
                       </td>
                       <td>
@@ -304,7 +297,7 @@ export const DebtPage: React.FC = () => {
                       {wv.status === 'ACTIVE' && (
                         <button
                           className="btn btn-secondary btn-sm"
-                          style={{ color: '#dc2626' }}
+                          style={{ color: 'var(--status-danger)' }}
                           onClick={() => {
                             setModalError(null);
                             setVoidReason('');
@@ -342,7 +335,7 @@ export const DebtPage: React.FC = () => {
                   backgroundColor: 'var(--status-danger-bg)',
                   border: '1px solid var(--status-danger-border)',
                   borderRadius: 'var(--radius-md)',
-                  color: '#991b1b',
+                  color: 'var(--status-danger-text)',
                   fontSize: '0.8125rem',
                   marginBottom: '1rem',
                 }}
@@ -472,7 +465,7 @@ export const DebtPage: React.FC = () => {
                   backgroundColor: 'var(--status-danger-bg)',
                   border: '1px solid var(--status-danger-border)',
                   borderRadius: 'var(--radius-md)',
-                  color: '#991b1b',
+                  color: 'var(--status-danger-text)',
                   fontSize: '0.8125rem',
                   marginBottom: '1rem',
                 }}

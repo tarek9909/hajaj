@@ -1,7 +1,8 @@
 import { Router, type Request, type Response, type NextFunction } from 'express';
 import type { RowDataPacket, ResultSetHeader } from 'mysql2/promise';
 import { withTransaction, pool } from '../../infrastructure/database/pool.js';
-import { createSalaryAdjustmentSchema, voidSalaryAdjustmentSchema } from '../../contracts/schemas.js';
+import { createSalaryAdjustmentSchema, voidSalaryAdjustmentSchema, monthQuerySchema } from '../../contracts/schemas.js';
+import { lockOpenPeriod, bumpSourceRevision } from '../payroll/periodLock.js';
 import { AppError } from '../../middleware/errorHandler.js';
 import { recordAuditEvent } from '../../infrastructure/logging/audit.js';
 
@@ -11,7 +12,7 @@ export const adjustmentRouter = Router({ mergeParams: true });
 adjustmentRouter.get('/', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const restaurantId = req.tenantContext!.restaurantId;
-    const month = (req.query.month as string) || new Date().toISOString().slice(0, 7);
+    const month = monthQuerySchema.parse(req.query.month || new Date().toISOString().slice(0, 7));
     const monthStart = `${month}-01`;
 
     const [rows] = await pool.execute<RowDataPacket[]>(
@@ -50,6 +51,7 @@ adjustmentRouter.get('/', async (req: Request, res: Response, next: NextFunction
       data: rows.map((r) => ({
         id: String(r.id),
         employeeId: String(r.employee_id),
+        fullName: r.employee_name,
         employeeName: r.employee_name,
         employeeNumber: r.employee_number,
         payrollMonth: r.payroll_month,
@@ -79,14 +81,15 @@ adjustmentRouter.get('/', async (req: Request, res: Response, next: NextFunction
 const handleCreateAdjustment = async (req: Request, res: Response, next: NextFunction) => {
   try {
     const restaurantId = req.tenantContext!.restaurantId;
-    const employeeId = String(req.params.employeeId || req.body.employeeId);
-    if (!employeeId || employeeId === 'undefined') {
+    const rawEmployeeId = req.params.employeeId ?? req.body?.employeeId;
+    if (rawEmployeeId === undefined || rawEmployeeId === null || String(rawEmployeeId).trim() === '') {
       throw new AppError(400, 'EMPLOYEE_ID_REQUIRED', 'Employee ID is required');
     }
+    const employeeId = String(rawEmployeeId);
     const actorId = req.tenantContext!.actorId;
 
     // Normalize payload
-    const rawBody = { ...req.body };
+    const rawBody = { ...(req.body ?? {}) };
     if (!rawBody.payrollMonth && rawBody.effectiveMonth) {
       rawBody.payrollMonth = rawBody.effectiveMonth.length === 7 ? `${rawBody.effectiveMonth}-01` : rawBody.effectiveMonth;
     }
@@ -114,14 +117,8 @@ const handleCreateAdjustment = async (req: Request, res: Response, next: NextFun
       );
       if (!empRows[0]) throw new AppError(404, 'EMPLOYEE_NOT_FOUND', 'Employee not found');
 
-      // Check payroll period
-      const [perRows] = await conn.execute<RowDataPacket[]>(
-        `SELECT status FROM payroll_periods WHERE restaurant_id = ? AND month_start = ?`,
-        [restaurantId, body.payrollMonth]
-      );
-      if (perRows[0]?.status === 'FINALIZED') {
-        throw new AppError(409, 'PAYROLL_PERIOD_FINALIZED', 'Cannot add adjustments to a finalized month');
-      }
+      // Ensure the period exists, lock it and reject if finalized
+      await lockOpenPeriod(conn, restaurantId, body.payrollMonth, 'Cannot add adjustments to a finalized month', true);
 
       const [resHeader] = await conn.execute<ResultSetHeader>(
         `INSERT INTO salary_adjustments 
@@ -143,11 +140,7 @@ const handleCreateAdjustment = async (req: Request, res: Response, next: NextFun
       );
       newAdjustmentId = resHeader.insertId;
 
-      // Increment source_revision
-      await conn.execute(
-        `UPDATE payroll_periods SET source_revision = source_revision + 1 WHERE restaurant_id = ? AND month_start = ?`,
-        [restaurantId, body.payrollMonth]
-      );
+      await bumpSourceRevision(conn, restaurantId, body.payrollMonth);
 
       await recordAuditEvent(
         {
@@ -182,29 +175,24 @@ adjustmentRouter.post('/:adjustmentId/void', async (req: Request, res: Response,
     const restaurantId = req.tenantContext!.restaurantId;
     const adjustmentId = String(req.params.adjustmentId);
     const actorId = req.tenantContext!.actorId;
-    const body = voidSalaryAdjustmentSchema.parse(req.body);
+    const body = voidSalaryAdjustmentSchema.parse(req.body ?? {});
 
     await withTransaction(async (conn) => {
       const [adjRows] = await conn.execute<RowDataPacket[]>(
-        `SELECT id, payroll_month, status, row_version FROM salary_adjustments WHERE restaurant_id = ? AND id = ?`,
+        `SELECT id, DATE_FORMAT(payroll_month, '%Y-%m-01') AS payroll_month, status, row_version
+         FROM salary_adjustments WHERE restaurant_id = ? AND id = ? FOR UPDATE`,
         [restaurantId, adjustmentId]
       );
       const adj = adjRows[0];
       if (!adj) throw new AppError(404, 'ADJUSTMENT_NOT_FOUND', 'Adjustment not found');
       if (adj.status === 'VOID') throw new AppError(400, 'ALREADY_VOIDED', 'Adjustment is already voided');
       if (Number(adj.row_version) !== body.expectedVersion) {
-        throw new AppError(412, 'ROW_VERSION_CONFLICT', 'Record was modified by another administrator');
+        throw new AppError(409, 'ROW_VERSION_CONFLICT', 'Record was modified by another administrator');
       }
 
-      const [perRows] = await conn.execute<RowDataPacket[]>(
-        `SELECT status FROM payroll_periods WHERE restaurant_id = ? AND month_start = ?`,
-        [restaurantId, adj.payroll_month]
-      );
-      if (perRows[0]?.status === 'FINALIZED') {
-        throw new AppError(409, 'PAYROLL_PERIOD_FINALIZED', 'Cannot void adjustments in a finalized month');
-      }
+      await lockOpenPeriod(conn, restaurantId, adj.payroll_month, 'Cannot void adjustments in a finalized month');
 
-      await conn.execute(
+      const [upd] = await conn.execute<ResultSetHeader>(
         `UPDATE salary_adjustments 
          SET status = 'VOID',
              void_reason = ?,
@@ -212,15 +200,14 @@ adjustmentRouter.post('/:adjustmentId/void', async (req: Request, res: Response,
              voided_at = NOW(3),
              row_version = row_version + 1,
              updated_by = ?
-         WHERE restaurant_id = ? AND id = ?`,
-        [body.voidReason, actorId, actorId, restaurantId, adjustmentId]
+         WHERE restaurant_id = ? AND id = ? AND row_version = ?`,
+        [body.voidReason, actorId, actorId, restaurantId, adjustmentId, body.expectedVersion]
       );
+      if (upd.affectedRows !== 1) {
+        throw new AppError(409, 'ROW_VERSION_CONFLICT', 'Record was modified by another administrator');
+      }
 
-      // Increment source_revision
-      await conn.execute(
-        `UPDATE payroll_periods SET source_revision = source_revision + 1 WHERE restaurant_id = ? AND month_start = ?`,
-        [restaurantId, adj.payroll_month]
-      );
+      await bumpSourceRevision(conn, restaurantId, adj.payroll_month);
 
       await recordAuditEvent(
         {

@@ -3,17 +3,34 @@
  */
 
 let cachedCsrfToken: string | null = null;
+let csrfInFlight: Promise<string | null> | null = null;
+let unauthorizedHandler: (() => void) | null = null;
 
-export async function fetchCsrfToken(): Promise<string | null> {
-  try {
-    const res = await fetch('/api/v1/auth/csrf', { credentials: 'include' });
-    if (!res.ok) return null;
-    const json = await res.json();
-    cachedCsrfToken = json.data?.csrfToken || null;
-    return cachedCsrfToken;
-  } catch {
-    return null;
-  }
+/** The auth layer registers this so an expired session sends the user back to sign-in. */
+export function setUnauthorizedHandler(fn: (() => void) | null): void {
+  unauthorizedHandler = fn;
+}
+
+export function setCsrfToken(token: string | null): void {
+  cachedCsrfToken = token;
+}
+
+export function fetchCsrfToken(): Promise<string | null> {
+  if (csrfInFlight) return csrfInFlight;
+  csrfInFlight = (async () => {
+    try {
+      const res = await fetch('/api/v1/auth/csrf', { credentials: 'include' });
+      if (!res.ok) return null;
+      const json = await res.json();
+      cachedCsrfToken = json.data?.csrfToken || null;
+      return cachedCsrfToken;
+    } catch {
+      return null;
+    } finally {
+      csrfInFlight = null;
+    }
+  })();
+  return csrfInFlight;
 }
 
 export class ApiError extends Error {
@@ -28,94 +45,151 @@ export class ApiError extends Error {
   }
 }
 
+/** Normalizes a YYYY-MM or YYYY-MM-DD value to the first day of that month (YYYY-MM-01). */
+function toMonthStart(value: string): string {
+  return `${value.slice(0, 7)}-01`;
+}
+
+/** Trimmed string, or null when blank. */
+function blankToNull(value: string | null | undefined): string | null {
+  const v = (value ?? '').trim();
+  return v === '' ? null : v;
+}
+
+const MUTATING = ['POST', 'PUT', 'PATCH', 'DELETE'];
+const PUBLIC_AUTH_PATHS = ['/api/v1/auth/login', '/api/v1/auth/password-setup', '/api/v1/auth/password-reset'];
+
+async function parseBody(res: Response): Promise<any> {
+  const contentType = res.headers.get('content-type') || '';
+  if (contentType.includes('application/json')) {
+    return res.json().catch(() => ({}));
+  }
+  return res.text();
+}
+
 export async function apiRequest<T = unknown>(
   url: string,
   options: RequestInit = {}
 ): Promise<T> {
   const method = (options.method || 'GET').toUpperCase();
-  const headers = new Headers(options.headers || {});
+  const isMutation = MUTATING.includes(method);
+  const needsCsrf = isMutation && !PUBLIC_AUTH_PATHS.some((p) => url.startsWith(p));
 
-  if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) {
-    if (!headers.has('Content-Type') && !(options.body instanceof FormData)) {
+  const send = async (): Promise<Response> => {
+    const headers = new Headers(options.headers || {});
+    if (isMutation && options.body && !headers.has('Content-Type') && !(options.body instanceof FormData)) {
       headers.set('Content-Type', 'application/json');
     }
-
-    if (!cachedCsrfToken) {
-      await fetchCsrfToken();
+    if (needsCsrf) {
+      if (!cachedCsrfToken) await fetchCsrfToken();
+      if (cachedCsrfToken) headers.set('X-CSRF-Token', cachedCsrfToken);
     }
-    if (cachedCsrfToken) {
-      headers.set('X-CSRF-Token', cachedCsrfToken);
+    return fetch(url, { ...options, headers, credentials: 'include' });
+  };
+
+  let res = await send();
+
+  // Stale/missing CSRF token (e.g. after a server restart): refresh once and retry.
+  if (res.status === 403 && needsCsrf) {
+    const probe = await res.clone().json().catch(() => null);
+    if (probe?.error?.code === 'CSRF_TOKEN_INVALID' || probe?.error?.code === 'CSRF_TOKEN_MISSING') {
+      cachedCsrfToken = null;
+      res = await send();
     }
   }
-
-  const res = await fetch(url, {
-    ...options,
-    headers,
-    credentials: 'include',
-  });
 
   if (res.status === 204) {
     return undefined as unknown as T;
   }
 
-  let body: any;
-  const contentType = res.headers.get('content-type');
-  if (contentType && contentType.includes('application/json')) {
-    body = await res.json();
-  } else {
-    body = await res.text();
-  }
+  const body = await parseBody(res);
 
   if (!res.ok) {
-    // If CSRF token expired or invalid, retry once
-    if (res.status === 403 && body?.error?.code === 'CSRF_INVALID') {
+    if (res.status === 401 && !PUBLIC_AUTH_PATHS.some((p) => url.startsWith(p)) && !url.startsWith('/api/v1/auth/me')) {
       cachedCsrfToken = null;
-      await fetchCsrfToken();
-      if (cachedCsrfToken) {
-        headers.set('X-CSRF-Token', cachedCsrfToken);
-        const retryRes = await fetch(url, { ...options, headers, credentials: 'include' });
-        if (retryRes.ok) {
-          const retryBody = await retryRes.json();
-          return retryBody.data ?? retryBody;
-        }
-      }
+      unauthorizedHandler?.();
     }
-
-    const err = body?.error || { code: 'UNKNOWN_ERROR', message: res.statusText };
+    const err = body?.error || { code: 'UNKNOWN_ERROR', message: res.statusText || 'Request failed' };
     throw new ApiError(res.status, err.code, err.message, err.details);
   }
 
-  return body.data !== undefined ? body.data : body;
+  return body && typeof body === 'object' && body.data !== undefined ? body.data : body;
 }
 
 // ==========================================
 // AUTH API
 // ==========================================
+export interface SessionIdentity {
+  adminAccountId: string;
+  accountKind: 'SUPERADMIN' | 'RESTAURANT_ADMIN';
+  restaurantId: string | null;
+  fullName: string;
+  email: string;
+  restaurantName?: string | null;
+  restaurantCurrency?: string | null;
+}
+
 export const authApi = {
-  login: (data: { email: string; password?: string }) =>
-    apiRequest<{ accountId: string; accountKind: string; restaurantId: string | null; fullName: string; email: string }>('/api/v1/auth/login', {
+  login: async (data: { email: string; password?: string }) => {
+    const res = await apiRequest<SessionIdentity & { csrfToken: string }>('/api/v1/auth/login', {
       method: 'POST',
       body: JSON.stringify(data),
-    }),
+    });
+    setCsrfToken(res.csrfToken ?? null);
+    return res;
+  },
 
-  logout: () =>
-    apiRequest<{ message: string }>('/api/v1/auth/logout', { method: 'POST' }),
+  logout: async () => {
+    try {
+      return await apiRequest<{ message: string }>('/api/v1/auth/logout', { method: 'POST' });
+    } finally {
+      setCsrfToken(null);
+    }
+  },
 
-  me: () =>
-    apiRequest<{
-      adminAccountId: string;
-      accountKind: 'SUPERADMIN' | 'RESTAURANT_ADMIN';
-      restaurantId: string | null;
-      fullName: string;
-      email: string;
-    }>('/api/v1/auth/me'),
+  me: () => apiRequest<SessionIdentity>('/api/v1/auth/me'),
 
   requestPasswordReset: (email: string) =>
-    apiRequest<{ message: string }>('/api/v1/auth/password/reset-request', {
+    apiRequest<{ message: string }>('/api/v1/auth/password-reset/request', {
       method: 'POST',
       body: JSON.stringify({ email }),
     }),
+
+  completePasswordReset: (token: string, newPassword: string) =>
+    apiRequest<{ message: string }>('/api/v1/auth/password-reset/complete', {
+      method: 'POST',
+      body: JSON.stringify({ token, newPassword }),
+    }),
+
+  setupPassword: (token: string, newPassword: string) =>
+    apiRequest<{ message: string }>('/api/v1/auth/password-setup', {
+      method: 'POST',
+      body: JSON.stringify({ token, newPassword }),
+    }),
 };
+
+// ==========================================
+// RESTAURANT PROFILE (tenant-scoped)
+// ==========================================
+export interface RestaurantProfile {
+  id: string;
+  name: string;
+  contactName: string | null;
+  contactMobile: string | null;
+  contactEmail: string | null;
+  currencyCode: string;
+  currencyDecimalPlaces: number;
+  timezone: string;
+  status: 'ACTIVE' | 'INACTIVE';
+  payrollStartMonth: string;
+  rowVersion: number;
+}
+
+export const restaurantApi = {
+  getProfile: (restaurantId: string) =>
+    apiRequest<RestaurantProfile>(`/api/v1/restaurants/${restaurantId}/profile`),
+};
+
 
 // ==========================================
 // PLATFORM / RESTAURANTS API
@@ -156,9 +230,23 @@ export const platformApi = {
     }>(`/api/v1/platform/restaurants/${restaurantId}`),
 
   onboardRestaurant: (data: any) =>
-    apiRequest<{ restaurantId: string; message: string }>('/api/v1/platform/restaurants', {
+    apiRequest<{ restaurantId: string; adminId?: string; message: string; setupPath?: string }>('/api/v1/platform/restaurants', {
       method: 'POST',
-      body: JSON.stringify(data),
+      body: JSON.stringify({
+        ...data,
+        // contactEmail must be a valid email or null; blank strings are rejected
+        contactName: blankToNull(data.contactName),
+        contactMobile: blankToNull(data.contactMobile),
+        contactEmail: blankToNull(data.contactEmail),
+        payrollStartMonth: toMonthStart(data.payrollStartMonth),
+        initialAdmin: data.initialAdmin
+          ? {
+              ...data.initialAdmin,
+              mobile: blankToNull(data.initialAdmin.mobile),
+              ...(data.initialAdmin.password ? {} : { password: undefined }),
+            }
+          : data.initialAdmin,
+      }),
     }),
 
   updateStatus: (restaurantId: string, status: 'ACTIVE' | 'INACTIVE', expectedVersion: number) =>
@@ -187,10 +275,31 @@ export const employeesApi = {
       rowVersion: number;
     }>>(`/api/v1/restaurants/${restaurantId}/employees${status ? `?status=${status}` : ''}`),
 
-  create: (restaurantId: string, data: any) =>
+  create: (
+    restaurantId: string,
+    data: {
+      employeeNumber: string;
+      fullName: string;
+      mobile: string;
+      positionId: string;
+      employmentStartDate: string;
+      initialSalary: string | number;
+      employmentEndDate?: string | null;
+      reason?: string;
+    }
+  ) =>
     apiRequest<{ id: string; message: string }>(`/api/v1/restaurants/${restaurantId}/employees`, {
       method: 'POST',
-      body: JSON.stringify(data),
+      body: JSON.stringify({
+        employeeNumber: data.employeeNumber,
+        fullName: data.fullName,
+        mobile: data.mobile,
+        positionId: data.positionId,
+        employmentStartDate: data.employmentStartDate,
+        employmentEndDate: blankToNull(data.employmentEndDate),
+        monthlySalary: Number(data.initialSalary),
+        reason: data.reason?.trim() || 'Initial salary',
+      }),
     }),
 
   get: (restaurantId: string, employeeId: string) =>
@@ -202,16 +311,49 @@ export const employeesApi = {
       body: JSON.stringify(data),
     }),
 
-  addSalaryRevision: (restaurantId: string, employeeId: string, data: any) =>
+  /** Activate/deactivate: dedicated route (PATCH /employees/:id does not accept status). */
+  updateStatus: (restaurantId: string, employeeId: string, status: 'ACTIVE' | 'INACTIVE', expectedVersion: number) =>
+    apiRequest<{ message: string }>(`/api/v1/restaurants/${restaurantId}/employees/${employeeId}/status`, {
+      method: 'PATCH',
+      body: JSON.stringify({ status, expectedVersion }),
+    }),
+
+  addSalaryRevision: (
+    restaurantId: string,
+    employeeId: string,
+    data: { effectiveFromMonth: string; monthlySalary: number; reason: string }
+  ) =>
     apiRequest<{ message: string }>(`/api/v1/restaurants/${restaurantId}/employees/${employeeId}/salaries`, {
       method: 'POST',
-      body: JSON.stringify(data),
+      body: JSON.stringify({ ...data, effectiveFromMonth: toMonthStart(data.effectiveFromMonth) }),
     }),
 };
 
 // ==========================================
 // SCHEDULING API
 // ==========================================
+export interface BulkScheduleForm {
+  employeeIds: string[];
+  startDate: string;
+  endDate: string;
+  shiftTemplateId: string;
+  dayType: 'WORK' | 'OFF';
+  weekdays: number[];
+  overwriteExisting: boolean;
+}
+
+function toBulkPayload(f: BulkScheduleForm) {
+  return {
+    employeeIds: f.employeeIds,
+    dateFrom: f.startDate,
+    dateTo: f.endDate,
+    weekdays: f.weekdays,
+    dayType: f.dayType,
+    shiftTemplateId: f.dayType === 'WORK' && f.shiftTemplateId ? f.shiftTemplateId : null,
+    existingEntryPolicy: f.overwriteExisting ? 'OVERWRITE' : 'REJECT_CONFLICTS',
+  };
+}
+
 export const schedulingApi = {
   getCalendar: (restaurantId: string, month: string) =>
     apiRequest<Array<{
@@ -230,16 +372,16 @@ export const schedulingApi = {
       }>;
     }>>(`/api/v1/restaurants/${restaurantId}/schedules?month=${month}`),
 
-  previewBulk: (restaurantId: string, data: any) =>
+  previewBulk: (restaurantId: string, data: BulkScheduleForm) =>
     apiRequest<{ totalDaysToGenerate: number; conflictCount: number; warnings: string[] }>(
       `/api/v1/restaurants/${restaurantId}/schedules/bulk-preview`,
-      { method: 'POST', body: JSON.stringify(data) }
+      { method: 'POST', body: JSON.stringify(toBulkPayload(data)) }
     ),
 
-  commitBulk: (restaurantId: string, data: any) =>
+  commitBulk: (restaurantId: string, data: BulkScheduleForm) =>
     apiRequest<{ scheduledDaysCount: number; message: string }>(
       `/api/v1/restaurants/${restaurantId}/schedules/bulk-commit`,
-      { method: 'POST', body: JSON.stringify(data) }
+      { method: 'POST', body: JSON.stringify(toBulkPayload(data)) }
     ),
 };
 
@@ -341,10 +483,19 @@ export const debtApi = {
       }>;
     }>(`/api/v1/restaurants/${restaurantId}/debt${month ? `?month=${month}` : ''}`),
 
-  createWaiver: (restaurantId: string, data: any) =>
+  createWaiver: (
+    restaurantId: string,
+    data: { employeeId?: string; debtSourceId: string; effectiveMonth: string; minutes: number; reason: string }
+  ) =>
     apiRequest<{ id: string; message: string }>(`/api/v1/restaurants/${restaurantId}/debt/waivers`, {
       method: 'POST',
-      body: JSON.stringify(data),
+      body: JSON.stringify({
+        employeeId: blankToNull(data.employeeId),
+        debtSourceId: data.debtSourceId,
+        effectiveMonth: toMonthStart(data.effectiveMonth),
+        minutes: Number(data.minutes),
+        reason: data.reason,
+      }),
     }),
 
   voidWaiver: (restaurantId: string, waiverId: string, data: { voidReason: string; expectedVersion: number }) =>
@@ -421,6 +572,11 @@ export const payrollApi = {
       employees: Array<any>;
     }>(`/api/v1/restaurants/${restaurantId}/payroll/periods/${month}`),
 
+  listPeriods: (restaurantId: string) =>
+    apiRequest<Array<{ month: string; status: string; currentCalculationRunId: string | null }>>(
+      `/api/v1/restaurants/${restaurantId}/payroll/periods`
+    ),
+
   getBlockers: (restaurantId: string, month: string) =>
     apiRequest<{
       totalBlockersCount: number;
@@ -459,7 +615,7 @@ export const configApi = {
   createPolicyVersion: (restaurantId: string, data: any) =>
     apiRequest<{ id: string; message: string }>(`/api/v1/restaurants/${restaurantId}/configuration/policies`, {
       method: 'POST',
-      body: JSON.stringify(data),
+      body: JSON.stringify({ ...data, effectiveFromMonth: toMonthStart(data.effectiveFromMonth) }),
     }),
 
   getPositions: (restaurantId: string) =>
@@ -502,10 +658,18 @@ export const configApi = {
       rowVersion: number;
     }>>(`/api/v1/restaurants/${restaurantId}/administrators`),
 
-  createAdministrator: (restaurantId: string, data: any) =>
-    apiRequest<{ id: string; message: string }>(`/api/v1/restaurants/${restaurantId}/administrators`, {
+  createAdministrator: (
+    restaurantId: string,
+    data: { fullName: string; email: string; mobile?: string | null; password?: string }
+  ) =>
+    apiRequest<{ id: string; message: string; setupPath?: string }>(`/api/v1/restaurants/${restaurantId}/administrators`, {
       method: 'POST',
-      body: JSON.stringify(data),
+      body: JSON.stringify({
+        fullName: data.fullName,
+        email: data.email,
+        mobile: blankToNull(data.mobile),
+        ...(data.password ? { password: data.password } : {}),
+      }),
     }),
 
   updateAdminStatus: (restaurantId: string, adminId: string, status: 'ACTIVE' | 'INACTIVE', expectedVersion: number) =>

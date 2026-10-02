@@ -1,18 +1,24 @@
+import path from 'path';
+import { pathToFileURL } from 'url';
 import type { RowDataPacket, ResultSetHeader } from 'mysql2/promise';
-import { pool } from '../infrastructure/database/pool.js';
+import { pool, withTransaction } from '../infrastructure/database/pool.js';
 import { hashPassword } from '../infrastructure/auth/passwords.js';
 import { bootstrapSuperadmin } from './bootstrapSuperadmin.js';
 import { PayrollService } from '../modules/payroll/payrollService.js';
 
 export async function seedDatabase(): Promise<void> {
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('Refusing to run the demo seed when NODE_ENV=production.');
+  }
+
   console.log('--- STARTING DETERMINISTIC SEEDING ---');
 
   // 1. Ensure Superadmin
-  await bootstrapSuperadmin(
-    'superadmin@workforce.local',
-    'Platform Superadmin',
-    'SuperAdminPassword123!'
-  );
+  await bootstrapSuperadmin({
+    email: 'superadmin@workforce.local',
+    fullName: 'Platform Superadmin',
+    password: 'SuperAdminPassword123!',
+  });
 
   const [superRows] = await pool.execute<RowDataPacket[]>(
     `SELECT id FROM admin_accounts WHERE email_normalized = 'superadmin@workforce.local'`
@@ -47,10 +53,7 @@ export async function seedDatabase(): Promise<void> {
      VALUES 
       (?, 'RESTAURANT_ADMIN', 'Julian Vance (General Manager)', 'admin.bistro@workforce.local', '+1 (555) 234-5678', ?, 0, 'ACTIVE', ?),
       (?, 'RESTAURANT_ADMIN', 'Sarah Jenkins (Ops Lead)', 'sarah.ops@workforce.local', '+1 (555) 234-5679', ?, 0, 'ACTIVE', ?)
-     ON DUPLICATE KEY UPDATE 
-      password_hash = VALUES(password_hash),
-      password_setup_required = 0,
-      status = 'ACTIVE'`,
+     ON DUPLICATE KEY UPDATE status = 'ACTIVE'`,
     [bistroId, bistroAdminPass, superadminId, bistroId, sarahAdminPass, superadminId]
   );
 
@@ -370,16 +373,25 @@ export async function seedDatabase(): Promise<void> {
     console.log('Calculating and finalizing August 2026...');
     const augRunId = await PayrollService.executeCalculationRun(String(bistroId), '2026-08', String(julianAdminId));
 
-    await pool.execute(
-      `UPDATE payroll_periods 
-       SET status = 'FINALIZED',
-           active_finalized_run_id = ?,
-           current_calculation_run_id = ?,
-           finalized_by = ?,
-           finalized_at = '2026-08-31 23:59:59'
-       WHERE restaurant_id = ? AND month_start = '2026-08-01'`,
-      [augRunId, augRunId, julianAdminId, bistroId]
-    );
+    await withTransaction(async (conn) => {
+      await conn.execute(
+        `UPDATE payroll_periods 
+         SET status = 'FINALIZED',
+             active_finalized_run_id = ?,
+             current_calculation_run_id = ?,
+             finalized_by = ?,
+             finalized_at = '2026-08-31 23:59:59',
+             row_version = row_version + 1
+         WHERE restaurant_id = ? AND month_start = '2026-08-01'`,
+        [augRunId, augRunId, julianAdminId, bistroId]
+      );
+      await conn.execute(
+        `INSERT INTO payroll_period_events 
+          (restaurant_id, payroll_period_id, calculation_run_id, event_type, actor_id, reason)
+         VALUES (?, ?, ?, 'FINALIZED', ?, 'Monthly payroll finalization')`,
+        [bistroId, augPeriod[0]!.id, augRunId, julianAdminId]
+      );
+    });
   } else {
     console.log('August 2026 is already finalized. Skipping calculation.');
   }
@@ -591,8 +603,8 @@ export async function seedDatabase(): Promise<void> {
       await pool.execute(
         `INSERT INTO attendance_intervals 
           (restaurant_id, employee_id, schedule_day_id, attendance_day_id, sequence_number, check_in_at, check_out_at, unpaid_break_minutes)
-         VALUES (?, ?, ?, ?, 1, '${workDate} 16:25:00', '2026-09-${nextDayStr} 00:30:00', 30)
-         ON DUPLICATE KEY UPDATE check_out_at = '2026-09-${nextDayStr} 00:30:00'`,
+         VALUES (?, ?, ?, ?, 1, '${workDate} 16:25:00', '2026-09-${nextDayStr} 00:55:00', 30)
+         ON DUPLICATE KEY UPDATE check_out_at = '2026-09-${nextDayStr} 00:55:00'`,
         [bistroId, davidId, schedDayId, attDayId]
       );
       await pool.execute(
@@ -815,10 +827,7 @@ export async function seedDatabase(): Promise<void> {
     `INSERT INTO admin_accounts 
       (restaurant_id, account_kind, full_name, email_normalized, mobile, password_hash, password_setup_required, status, created_by)
      VALUES (?, 'RESTAURANT_ADMIN', 'Tariq Al-Mansoor', 'admin.spice@workforce.local', '+966 50 123 4567', ?, 0, 'ACTIVE', ?)
-     ON DUPLICATE KEY UPDATE 
-      password_hash = VALUES(password_hash),
-      password_setup_required = 0,
-      status = 'ACTIVE'`,
+     ON DUPLICATE KEY UPDATE status = 'ACTIVE'`,
     [spiceId, spiceAdminPass, superadminId]
   );
 
@@ -920,7 +929,7 @@ export async function seedDatabase(): Promise<void> {
   console.log('--- DETERMINISTIC SEEDING COMPLETED SUCCESSFULLY ---');
 }
 
-if (process.argv[1]?.includes('seed')) {
+if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url) {
   seedDatabase()
     .then(() => {
       console.log('Seed process finished successfully.');

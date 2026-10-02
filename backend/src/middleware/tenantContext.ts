@@ -1,5 +1,7 @@
 import type { Request, Response, NextFunction } from 'express';
 import crypto from 'crypto';
+import type { RowDataPacket } from 'mysql2/promise';
+import { pool } from '../infrastructure/database/pool.js';
 import { SessionManager } from '../infrastructure/sessions/sessionManager.js';
 import type { TenantContext, UserSession } from '../contracts/types.js';
 
@@ -83,7 +85,24 @@ export const requireSuperadmin = (req: Request, res: Response, next: NextFunctio
   next();
 };
 
-export const resolveTenantContext = (req: Request, res: Response, next: NextFunction): void => {
+const RESTAURANT_EXISTS_TTL_MS = 60 * 1000;
+const knownRestaurants = new Map<string, number>();
+
+async function restaurantExists(restaurantId: string): Promise<boolean> {
+  const cachedUntil = knownRestaurants.get(restaurantId);
+  if (cachedUntil && cachedUntil > Date.now()) return true;
+
+  const [rows] = await pool.execute<RowDataPacket[]>(`SELECT id FROM restaurants WHERE id = ?`, [restaurantId]);
+  if (!rows[0]) {
+    knownRestaurants.delete(restaurantId);
+    return false;
+  }
+  if (knownRestaurants.size > 1000) knownRestaurants.clear();
+  knownRestaurants.set(restaurantId, Date.now() + RESTAURANT_EXISTS_TTL_MS);
+  return true;
+}
+
+export const resolveTenantContext = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   const sessionUser = req.sessionUser;
   if (!sessionUser) {
     res.status(401).json({
@@ -103,6 +122,14 @@ export const resolveTenantContext = (req: Request, res: Response, next: NextFunc
     return;
   }
 
+  if (!/^[1-9]\d{0,19}$/.test(routeRestaurantId)) {
+    res.status(400).json({
+      error: { code: 'INVALID_TENANT_ID', message: 'Restaurant ID must be a positive integer' },
+      meta: { requestId: req.requestId },
+    });
+    return;
+  }
+
   // Superadmins can access any restaurant context.
   // Restaurant admins can ONLY access their own assigned restaurant.
   if (sessionUser.accountKind === 'RESTAURANT_ADMIN') {
@@ -112,6 +139,20 @@ export const resolveTenantContext = (req: Request, res: Response, next: NextFunc
         meta: { requestId: req.requestId },
       });
       return;
+    }
+  }
+
+  if (sessionUser.accountKind === 'SUPERADMIN') {
+    try {
+      if (!(await restaurantExists(routeRestaurantId))) {
+        res.status(404).json({
+          error: { code: 'RESTAURANT_NOT_FOUND', message: 'Restaurant not found' },
+          meta: { requestId: req.requestId },
+        });
+        return;
+      }
+    } catch (err) {
+      return next(err);
     }
   }
 

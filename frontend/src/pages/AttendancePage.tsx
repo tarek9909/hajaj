@@ -1,3 +1,6 @@
+import { todayIso } from '../lib/format';
+import { DateTime } from 'luxon';
+import { useRestaurant } from '../hooks/useRestaurant';
 import React, { useState } from 'react';
 import { useParams } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
@@ -12,10 +15,17 @@ import {
 } from 'lucide-react';
 
 export const AttendancePage: React.FC = () => {
-  const { restaurantId = '1' } = useParams<{ restaurantId: string }>();
+  const { restaurantId = '' } = useParams<{ restaurantId: string }>();
   const queryClient = useQueryClient();
+  const { restaurant } = useRestaurant();
+  const tz = restaurant?.timezone || 'UTC';
 
-  const [selectedDate, setSelectedDate] = useState('2026-09-01');
+  // Clock times are entered and shown in the restaurant's timezone, stored as UTC instants
+  const toLocalInput = (iso: string) => DateTime.fromISO(iso).setZone(tz).toFormat("yyyy-MM-dd'T'HH:mm");
+  const toClock = (iso: string) => DateTime.fromISO(iso).setZone(tz).toFormat('HH:mm');
+  const toInstant = (local: string) => DateTime.fromISO(local, { zone: tz }).toUTC().toISO() as string;
+
+  const [selectedDate, setSelectedDate] = useState(todayIso());
   const [editingDay, setEditingDay] = useState<any | null>(null);
   const [modalError, setModalError] = useState<string | null>(null);
 
@@ -58,10 +68,11 @@ export const AttendancePage: React.FC = () => {
     setModalError(null);
     setEditingDay(day);
 
+    const planned = day.plannedIntervals?.[0];
     const intv = day.actualIntervals?.[0] || {
-      checkInAt: `${selectedDate}T08:00:00Z`,
-      checkOutAt: `${selectedDate}T16:30:00Z`,
-      unpaidBreakMinutes: 30,
+      checkInAt: planned?.plannedStartAt ?? null,
+      checkOutAt: planned?.plannedEndAt ?? null,
+      unpaidBreakMinutes: planned?.plannedUnpaidBreakMinutes ?? 30,
     };
 
     setFormState({
@@ -71,8 +82,8 @@ export const AttendancePage: React.FC = () => {
       intervals: [
         {
           sequenceNumber: 1,
-          checkInAt: intv.checkInAt ? intv.checkInAt.slice(0, 16) : `${selectedDate}T08:00`,
-          checkOutAt: intv.checkOutAt ? intv.checkOutAt.slice(0, 16) : `${selectedDate}T16:30`,
+          checkInAt: intv.checkInAt ? toLocalInput(intv.checkInAt) : `${selectedDate}T08:00`,
+          checkOutAt: intv.checkOutAt ? toLocalInput(intv.checkOutAt) : `${selectedDate}T16:30`,
           unpaidBreakMinutes: intv.unpaidBreakMinutes ?? 30,
         },
       ],
@@ -96,12 +107,12 @@ export const AttendancePage: React.FC = () => {
 
   return (
     <div>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '1.75rem', flexWrap: 'wrap', gap: '1rem' }}>
+      <div className="page-header">
         <div>
-          <h1 style={{ fontSize: '1.75rem', fontWeight: 700, letterSpacing: '-0.02em' }}>
-            Daily Attendance Register
+          <h1 className="page-title">
+            Attendance
           </h1>
-          <p style={{ color: 'var(--text-muted)', fontSize: '0.875rem', marginTop: '0.25rem' }}>
+          <p className="page-subtitle">
             Verify check-in/out times, approve extra hours, and trigger automatic debt/lateness evaluations.
           </p>
         </div>
@@ -150,8 +161,19 @@ export const AttendancePage: React.FC = () => {
               ) : (
                 attendanceList.map((record) => {
                   const act = record.actualIntervals?.[0];
-                  const lateMins = act?.lateMinutes || 0;
-                  const workedMins = act?.workedMinutes || 0;
+                  const plannedStart = record.plannedIntervals?.[0]?.plannedStartAt;
+                  const lateMins =
+                    act?.checkInAt && plannedStart
+                      ? Math.max(0, Math.floor(DateTime.fromISO(act.checkInAt).diff(DateTime.fromISO(plannedStart), 'minutes').minutes))
+                      : 0;
+                  const workedMins =
+                    act?.checkInAt && act?.checkOutAt
+                      ? Math.max(
+                          0,
+                          Math.floor(DateTime.fromISO(act.checkOutAt).diff(DateTime.fromISO(act.checkInAt), 'minutes').minutes) -
+                            (act.unpaidBreakMinutes || 0)
+                        )
+                      : 0;
 
                   return (
                     <tr key={record.attendanceDayId || record.scheduleDayId}>
@@ -172,8 +194,8 @@ export const AttendancePage: React.FC = () => {
                       <td>
                         {act?.checkInAt ? (
                           <div className="mono" style={{ fontSize: '0.8125rem' }}>
-                            {new Date(act.checkInAt).toISOString().slice(11, 16)} -{' '}
-                            {act.checkOutAt ? new Date(act.checkOutAt).toISOString().slice(11, 16) : 'Ongoing'}
+                            {toClock(act.checkInAt)} -{' '}
+                            {act.checkOutAt ? toClock(act.checkOutAt) : 'Ongoing'}
                             <span style={{ color: 'var(--text-muted)', marginLeft: 6 }}>
                               (Break: {act.unpaidBreakMinutes || 0}m)
                             </span>
@@ -184,7 +206,7 @@ export const AttendancePage: React.FC = () => {
                       </td>
                       <td className="tabular-nums">
                         {workedMins > 0 ? (
-                          <span style={{ fontWeight: 600, color: workedMins < record.requiredMinutes ? '#dc2626' : '#16a34a' }}>
+                          <span style={{ fontWeight: 600, color: workedMins < record.requiredMinutes ? 'var(--status-danger)' : 'var(--status-success)' }}>
                             {workedMins} mins
                           </span>
                         ) : (
@@ -250,7 +272,7 @@ export const AttendancePage: React.FC = () => {
                   backgroundColor: 'var(--status-danger-bg)',
                   border: '1px solid var(--status-danger-border)',
                   borderRadius: 'var(--radius-md)',
-                  color: '#991b1b',
+                  color: 'var(--status-danger-text)',
                   fontSize: '0.8125rem',
                   marginBottom: '1rem',
                 }}
@@ -265,16 +287,16 @@ export const AttendancePage: React.FC = () => {
                 e.preventDefault();
                 setModalError(null);
                 updateMutation.mutate({
-                  dayId: editingDay.attendanceDayId,
+                  dayId: editingDay.attendanceDayId ?? `by-schedule/${editingDay.scheduleDayId}`,
                   payload: {
                     status: formState.status,
                     additionalWorkApproved: formState.additionalWorkApproved,
                     notes: formState.notes,
-                    expectedVersion: editingDay.rowVersion,
+                    expectedVersion: editingDay.rowVersion ?? 0,
                     intervals: formState.intervals.map((i) => ({
                       sequenceNumber: i.sequenceNumber,
-                      checkInAt: new Date(i.checkInAt).toISOString(),
-                      checkOutAt: i.checkOutAt ? new Date(i.checkOutAt).toISOString() : null,
+                      checkInAt: toInstant(i.checkInAt),
+                      checkOutAt: i.checkOutAt ? toInstant(i.checkOutAt) : null,
                       unpaidBreakMinutes: Number(i.unpaidBreakMinutes),
                     })),
                   },

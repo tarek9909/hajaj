@@ -3,10 +3,23 @@ import type { RowDataPacket, ResultSetHeader } from 'mysql2/promise';
 import { withTransaction, pool } from '../../infrastructure/database/pool.js';
 import { PayrollService } from './payrollService.js';
 import { reopenPayrollPeriodSchema } from '../../contracts/schemas.js';
+import { Decimal } from 'decimal.js';
 import { AppError } from '../../middleware/errorHandler.js';
 import { recordAuditEvent } from '../../infrastructure/logging/audit.js';
 
 export const payrollRouter = Router({ mergeParams: true });
+
+function parseMonth(value: unknown): string {
+  const month = String(value);
+  if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(month)) {
+    throw new AppError(422, 'VALIDATION_ERROR', 'month must be in YYYY-MM format');
+  }
+  return month;
+}
+
+const money = (v: unknown): number | null => (v === null || v === undefined ? null : Number(v));
+const sumMoney = (values: Array<number | null>): number =>
+  values.reduce<Decimal>((acc, v) => acc.plus(v ?? 0), new Decimal(0)).toNumber();
 
 // GET /api/v1/restaurants/:restaurantId/payroll/periods
 payrollRouter.get('/periods', async (req: Request, res: Response, next: NextFunction) => {
@@ -60,7 +73,7 @@ payrollRouter.get('/periods', async (req: Request, res: Response, next: NextFunc
 payrollRouter.get('/periods/:month', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const restaurantId = req.tenantContext!.restaurantId;
-    const month = String(req.params.month);
+    const month = parseMonth(req.params.month);
     const monthStart = `${month}-01`;
 
     const [rows] = await pool.execute<RowDataPacket[]>(
@@ -86,7 +99,41 @@ payrollRouter.get('/periods/:month', async (req: Request, res: Response, next: N
 
     const period = rows[0];
     if (!period) {
-      throw new AppError(404, 'PAYROLL_PERIOD_NOT_FOUND', `Payroll period ${month} not found`);
+      // A month nobody has touched yet is a valid, empty state — not an error
+      res.json({
+        data: {
+          period: {
+            id: null,
+            monthStart,
+            month,
+            status: 'DRAFT',
+            sourceRevision: 0,
+            currentCalculationRunId: null,
+            activeFinalizedRunId: null,
+            finalizedAt: null,
+            calculatedAt: null,
+            isStale: true,
+            finalizedByName: null,
+            exists: false,
+          },
+          summary: {
+            totalEmployees: 0,
+            totalContractualSalary: 0,
+            totalBaseDue: 0,
+            totalOvertimePay: 0,
+            totalAdditions: 0,
+            totalLateDeductions: 0,
+            totalOtherDeductions: 0,
+            totalNetPayable: 0,
+            totalRecoveredDebtMinutes: 0,
+            totalRemainingDebtMinutes: 0,
+            warningLimitCount: 0,
+          },
+          employees: [],
+        },
+        meta: { requestId: req.requestId },
+      });
+      return;
     }
 
     const runId = period.status === 'FINALIZED' && period.active_finalized_run_id
@@ -187,17 +234,17 @@ payrollRouter.get('/periods/:month', async (req: Request, res: Response, next: N
           fullNameSnapshot: e.full_name_snapshot,
           positionName: e.position_name_snapshot,
           positionNameSnapshot: e.position_name_snapshot,
-          contractualMonthlySalary: Number(e.contractual_monthly_salary),
-          baseSalary: Number(e.base_salary_due),
-          baseSalaryDue: Number(e.base_salary_due),
-          overtimePay: Number(e.overtime_amount),
-          overtimeAmount: Number(e.overtime_amount),
-          additionAmount: Number(e.addition_amount),
-          lateDeductions: Number(e.late_deduction_amount),
-          lateDeductionAmount: Number(e.late_deduction_amount),
-          otherDeductions: Number(e.other_deduction_amount),
-          otherDeductionAmount: Number(e.other_deduction_amount),
-          netSalary: Number(e.net_salary),
+          contractualMonthlySalary: money(e.contractual_monthly_salary),
+          baseSalary: money(e.base_salary_due),
+          baseSalaryDue: money(e.base_salary_due),
+          overtimePay: money(e.overtime_amount),
+          overtimeAmount: money(e.overtime_amount),
+          additionAmount: money(e.addition_amount),
+          lateDeductions: money(e.late_deduction_amount),
+          lateDeductionAmount: money(e.late_deduction_amount),
+          otherDeductions: money(e.other_deduction_amount),
+          otherDeductionAmount: money(e.other_deduction_amount),
+          netSalary: money(e.net_salary),
           scheduledDays: Number(e.scheduled_days),
           attendedDays: Number(e.attended_days),
           absentDays: Number(e.absent_days),
@@ -228,13 +275,13 @@ payrollRouter.get('/periods/:month', async (req: Request, res: Response, next: N
 
     const summary = {
       totalEmployees: employeesList.length,
-      totalContractualSalary: employeesList.reduce((acc, cur) => acc + cur.contractualMonthlySalary, 0),
-      totalBaseDue: employeesList.reduce((acc, cur) => acc + cur.baseSalaryDue, 0),
-      totalOvertimePay: employeesList.reduce((acc, cur) => acc + cur.overtimeAmount, 0),
-      totalAdditions: employeesList.reduce((acc, cur) => acc + cur.additionAmount, 0),
-      totalLateDeductions: employeesList.reduce((acc, cur) => acc + cur.lateDeductionAmount, 0),
-      totalOtherDeductions: employeesList.reduce((acc, cur) => acc + cur.otherDeductionAmount, 0),
-      totalNetPayable: employeesList.reduce((acc, cur) => acc + cur.netSalary, 0),
+      totalContractualSalary: sumMoney(employeesList.map((e) => e.contractualMonthlySalary)),
+      totalBaseDue: sumMoney(employeesList.map((e) => e.baseSalaryDue)),
+      totalOvertimePay: sumMoney(employeesList.map((e) => e.overtimeAmount)),
+      totalAdditions: sumMoney(employeesList.map((e) => e.additionAmount)),
+      totalLateDeductions: sumMoney(employeesList.map((e) => e.lateDeductionAmount)),
+      totalOtherDeductions: sumMoney(employeesList.map((e) => e.otherDeductionAmount)),
+      totalNetPayable: sumMoney(employeesList.map((e) => e.netSalary)),
       totalRecoveredDebtMinutes: employeesList.reduce((acc, cur) => acc + cur.recoveredMinutes, 0),
       totalRemainingDebtMinutes: employeesList.reduce((acc, cur) => acc + cur.closingDebtMinutes, 0),
       warningLimitCount: employeesList.filter((e) => e.warningLimitReached).length,
@@ -270,10 +317,19 @@ payrollRouter.get('/periods/:month', async (req: Request, res: Response, next: N
 const handleCalculation = async (req: Request, res: Response, next: NextFunction) => {
   try {
     const restaurantId = req.tenantContext!.restaurantId;
-    const month = String(req.params.month);
+    const month = parseMonth(req.params.month);
     const actorId = req.tenantContext!.actorId;
 
     const calculationRunId = await PayrollService.executeCalculationRun(restaurantId, month, actorId);
+    await recordAuditEvent({
+      restaurantId,
+      actorId,
+      actorKind: req.tenantContext!.accountKind,
+      action: 'CALCULATE_PAYROLL',
+      entityType: 'PAYROLL_PERIOD',
+      requestId: req.requestId,
+      afterValues: { month, calculationRunId },
+    });
 
     res.json({
       data: {
@@ -294,7 +350,7 @@ payrollRouter.post('/periods/:month/recalculate', handleCalculation);
 payrollRouter.get('/periods/:month/blockers', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const restaurantId = req.tenantContext!.restaurantId;
-    const month = String(req.params.month);
+    const month = parseMonth(req.params.month);
     const monthStart = `${month}-01`;
 
     const [rows] = await pool.execute<RowDataPacket[]>(
@@ -337,7 +393,7 @@ payrollRouter.get('/periods/:month/blockers', async (req: Request, res: Response
 payrollRouter.post('/periods/:month/finalize', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const restaurantId = req.tenantContext!.restaurantId;
-    const month = req.params.month;
+    const month = parseMonth(req.params.month);
     const monthStart = `${month}-01`;
     const actorId = req.tenantContext!.actorId;
 
@@ -361,7 +417,7 @@ payrollRouter.post('/periods/:month/finalize', async (req: Request, res: Respons
 
       // 2. Check calculation freshness
       const [runRows] = await conn.execute<RowDataPacket[]>(
-        `SELECT id, input_revision, status FROM calculation_runs WHERE id = ?`,
+        `SELECT id, input_revision, status, previous_finalized_run_id FROM calculation_runs WHERE id = ?`,
         [period.current_calculation_run_id]
       );
       const run = runRows[0];
@@ -390,7 +446,7 @@ payrollRouter.post('/periods/:month/finalize', async (req: Request, res: Respons
 
       // 4. Check preceding period dependency (if exists, must be finalized)
       const [prevRows] = await conn.execute<RowDataPacket[]>(
-        `SELECT id, status FROM payroll_periods 
+        `SELECT id, status, active_finalized_run_id FROM payroll_periods 
          WHERE restaurant_id = ? AND month_start = DATE_SUB(?, INTERVAL 1 MONTH)`,
         [restaurantId, monthStart]
       );
@@ -399,6 +455,16 @@ payrollRouter.post('/periods/:month/finalize', async (req: Request, res: Respons
           409,
           'PRECEDING_PERIOD_UNFINALIZED',
           'The preceding month must be finalized before this month can be finalized.'
+        );
+      }
+      // The opening debt this run used must still be the preceding month's active finalized result
+      const expectedPrevRun = prevRows[0]?.active_finalized_run_id ? String(prevRows[0].active_finalized_run_id) : null;
+      const usedPrevRun = run.previous_finalized_run_id ? String(run.previous_finalized_run_id) : null;
+      if (expectedPrevRun !== usedPrevRun) {
+        throw new AppError(
+          409,
+          'CALCULATION_STALE',
+          'The preceding month changed since this calculation. Please recalculate before finalization.'
         );
       }
 
@@ -450,10 +516,10 @@ payrollRouter.post('/periods/:month/finalize', async (req: Request, res: Respons
 payrollRouter.post('/periods/:month/reopen', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const restaurantId = req.tenantContext!.restaurantId;
-    const month = req.params.month;
+    const month = parseMonth(req.params.month);
     const monthStart = `${month}-01`;
     const actorId = req.tenantContext!.actorId;
-    const body = reopenPayrollPeriodSchema.parse(req.body);
+    const body = reopenPayrollPeriodSchema.parse(req.body ?? {});
 
     await withTransaction(async (conn) => {
       // 1. Lock period

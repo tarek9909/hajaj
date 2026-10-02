@@ -11,6 +11,22 @@ export function generateToken(): string {
   return crypto.randomBytes(32).toString('hex');
 }
 
+function sessionSecret(): string {
+  const secret = process.env.SESSION_SECRET;
+  if (!secret && process.env.NODE_ENV === 'production') {
+    throw new Error('SESSION_SECRET must be set in production');
+  }
+  return secret || 'dev-only-insecure-session-secret';
+}
+
+/**
+ * The CSRF token is derived from the session token so it can be re-issued to the
+ * SPA after a page reload without storing the plaintext anywhere.
+ */
+export function deriveCsrfToken(sessionToken: string): string {
+  return crypto.createHmac('sha256', sessionSecret()).update(`csrf:${sessionToken}`).digest('hex');
+}
+
 export class SessionManager {
   /**
    * Creates a new session in the database, returns the plaintext session token and CSRF token.
@@ -21,7 +37,7 @@ export class SessionManager {
   ): Promise<{ sessionToken: string; csrfToken: string }> {
     const conn = connection || pool;
     const sessionToken = generateToken();
-    const csrfToken = generateToken();
+    const csrfToken = deriveCsrfToken(sessionToken);
 
     const tokenHash = hashToken(sessionToken);
     const csrfHash = hashToken(csrfToken);
@@ -130,7 +146,9 @@ export class SessionManager {
     const session = rows[0];
     if (!session) return false;
 
-    return crypto.timingSafeEqual(session.csrf_token_hash as Buffer, csrfHash);
+    const stored = session.csrf_token_hash as Buffer;
+    if (stored.length !== csrfHash.length) return false;
+    return crypto.timingSafeEqual(stored, csrfHash);
   }
 
   /**

@@ -8,6 +8,8 @@ import {
 } from '../../contracts/schemas.js';
 import { AppError } from '../../middleware/errorHandler.js';
 import { recordAuditEvent } from '../../infrastructure/logging/audit.js';
+import { z } from 'zod';
+import { assertMonthNotFinalized, bumpSourceRevision, normalizeMonthStart } from '../configuration/periodGuards.js';
 
 export const employeeRouter = Router({ mergeParams: true });
 
@@ -35,6 +37,7 @@ employeeRouter.get('/', async (req: Request, res: Response, next: NextFunction) 
           SELECT s.monthly_salary 
           FROM employee_salary_versions s 
           WHERE s.restaurant_id = e.restaurant_id AND s.employee_id = e.id 
+            AND s.effective_from_month <= DATE_FORMAT(CURRENT_DATE(), '%Y-%m-01')
           ORDER BY s.effective_from_month DESC, s.revision_no DESC 
           LIMIT 1
         ) AS current_monthly_salary,
@@ -51,10 +54,13 @@ employeeRouter.get('/', async (req: Request, res: Response, next: NextFunction) 
         ) AS current_month_warnings,
         COALESCE(
           (
-            SELECT SUM(COALESCE(s.imported_minutes, d.shortfall_minutes, 0))
-            FROM hour_debt_sources s
-            LEFT JOIN payroll_daily_results d ON d.attendance_day_id = s.attendance_day_id
-            WHERE s.restaurant_id = e.restaurant_id AND s.employee_id = e.id
+            SELECT SUM(v.closing_minutes)
+            FROM v_current_debt_details v
+            WHERE v.restaurant_id = e.restaurant_id AND v.employee_id = e.id
+              AND v.month_start = (
+                SELECT MAX(v2.month_start) FROM v_current_debt_details v2
+                WHERE v2.restaurant_id = e.restaurant_id AND v2.employee_id = e.id
+              )
           ), 0
         ) AS total_debt_minutes
       FROM employees e
@@ -83,7 +89,8 @@ employeeRouter.get('/', async (req: Request, res: Response, next: NextFunction) 
     // Fetch current policy warning threshold
     const [polRows] = await pool.execute<RowDataPacket[]>(
       `SELECT warning_threshold FROM restaurant_policy_versions 
-       WHERE restaurant_id = ? ORDER BY effective_from_month DESC LIMIT 1`,
+       WHERE restaurant_id = ? AND effective_from_month <= DATE_FORMAT(CURRENT_DATE(), '%Y-%m-01')
+       ORDER BY effective_from_month DESC, revision_no DESC LIMIT 1`,
       [restaurantId]
     );
     const warningThreshold = polRows[0] ? Number(polRows[0].warning_threshold) : 3;
@@ -99,6 +106,7 @@ employeeRouter.get('/', async (req: Request, res: Response, next: NextFunction) 
         status: r.status,
         employmentStartDate: r.employment_start_date,
         employmentEndDate: r.employment_end_date,
+        monthlySalary: r.current_monthly_salary === null ? null : Number(r.current_monthly_salary),
         currentMonthlySalary: Number(r.current_monthly_salary || 0),
         currentMonthWarnings: Number(r.current_month_warnings || 0),
         warningThreshold,
@@ -207,6 +215,7 @@ employeeRouter.get('/:employeeId', async (req: Request, res: Response, next: Nex
           SELECT s.monthly_salary 
           FROM employee_salary_versions s 
           WHERE s.restaurant_id = e.restaurant_id AND s.employee_id = e.id 
+            AND s.effective_from_month <= DATE_FORMAT(CURRENT_DATE(), '%Y-%m-01')
           ORDER BY s.effective_from_month DESC, s.revision_no DESC 
           LIMIT 1
         ) AS current_monthly_salary,
@@ -234,7 +243,8 @@ employeeRouter.get('/:employeeId', async (req: Request, res: Response, next: Nex
 
     const [polRows] = await pool.execute<RowDataPacket[]>(
       `SELECT warning_threshold FROM restaurant_policy_versions 
-       WHERE restaurant_id = ? ORDER BY effective_from_month DESC LIMIT 1`,
+       WHERE restaurant_id = ? AND effective_from_month <= DATE_FORMAT(CURRENT_DATE(), '%Y-%m-01')
+       ORDER BY effective_from_month DESC, revision_no DESC LIMIT 1`,
       [restaurantId]
     );
     const warningThreshold = polRows[0] ? Number(polRows[0].warning_threshold) : 3;
@@ -250,6 +260,7 @@ employeeRouter.get('/:employeeId', async (req: Request, res: Response, next: Nex
         status: emp.status,
         employmentStartDate: emp.employment_start_date,
         employmentEndDate: emp.employment_end_date,
+        monthlySalary: emp.current_monthly_salary === null ? null : Number(emp.current_monthly_salary),
         currentMonthlySalary: Number(emp.current_monthly_salary || 0),
         currentMonthWarnings: Number(emp.current_month_warnings || 0),
         warningThreshold,
@@ -272,30 +283,93 @@ employeeRouter.patch('/:employeeId', async (req: Request, res: Response, next: N
     const actorId = req.tenantContext!.actorId;
     const body = updateEmployeeSchema.parse(req.body);
 
-    const [updateRes] = await pool.execute<ResultSetHeader>(
-      `UPDATE employees 
-       SET full_name = COALESCE(?, full_name),
-           mobile = COALESCE(?, mobile),
-           position_id = COALESCE(?, position_id),
-           employment_end_date = COALESCE(?, employment_end_date),
-           row_version = row_version + 1,
-           updated_by = ?
-       WHERE restaurant_id = ? AND id = ? AND row_version = ?`,
-      [
-        body.fullName || null,
-        body.mobile || null,
-        body.positionId || null,
-        body.employmentEndDate !== undefined ? body.employmentEndDate : null,
-        actorId,
-        restaurantId,
-        employeeId,
-        body.expectedVersion,
-      ]
-    );
-
-    if (updateRes.affectedRows === 0) {
-      throw new AppError(412, 'ROW_VERSION_CONFLICT', 'Employee record was modified by another administrator');
+    if (body.mobile !== undefined && body.mobile.trim() === '') {
+      throw new AppError(422, 'INVALID_INPUT', 'mobile cannot be empty');
     }
+
+    await withTransaction(async (conn) => {
+      const [curRows] = await conn.execute<RowDataPacket[]>(
+        `SELECT id, full_name, mobile, position_id, row_version,
+                DATE_FORMAT(employment_start_date, '%Y-%m-%d') AS employment_start_date,
+                DATE_FORMAT(employment_end_date, '%Y-%m-%d') AS employment_end_date
+         FROM employees WHERE restaurant_id = ? AND id = ? FOR UPDATE`,
+        [restaurantId, employeeId]
+      );
+      const cur = curRows[0];
+      if (!cur) throw new AppError(404, 'EMPLOYEE_NOT_FOUND', 'Employee not found');
+      if (Number(cur.row_version) !== body.expectedVersion) {
+        throw new AppError(412, 'ROW_VERSION_CONFLICT', 'Employee record was modified by another administrator');
+      }
+
+      if (body.positionId !== undefined) {
+        if (!/^\d+$/.test(body.positionId)) {
+          throw new AppError(422, 'INVALID_POSITION', 'positionId is invalid');
+        }
+        const [posRows] = await conn.execute<RowDataPacket[]>(
+          `SELECT id FROM positions WHERE restaurant_id = ? AND id = ?`,
+          [restaurantId, body.positionId]
+        );
+        if (posRows.length === 0) {
+          throw new AppError(422, 'INVALID_POSITION', 'Position does not exist in this restaurant');
+        }
+      }
+
+      // employmentEndDate: undefined = unchanged, null = clear, string = set
+      const endDateProvided = body.employmentEndDate !== undefined;
+      const newEnd: string | null = endDateProvided ? (body.employmentEndDate as string | null) : cur.employment_end_date;
+      if (newEnd && newEnd < cur.employment_start_date) {
+        throw new AppError(422, 'INVALID_DATE_RANGE', 'employmentEndDate cannot be before employmentStartDate');
+      }
+
+      const sets: string[] = [];
+      const params: any[] = [];
+      if (body.fullName !== undefined) { sets.push('full_name = ?'); params.push(body.fullName); }
+      if (body.mobile !== undefined) { sets.push('mobile = ?'); params.push(body.mobile.trim()); }
+      if (body.positionId !== undefined) { sets.push('position_id = ?'); params.push(body.positionId); }
+      if (endDateProvided) { sets.push('employment_end_date = ?'); params.push(body.employmentEndDate); }
+
+      const [updateRes] = await conn.execute<ResultSetHeader>(
+        `UPDATE employees
+         SET ${sets.length ? sets.join(', ') + ',' : ''} row_version = row_version + 1, updated_by = ?
+         WHERE restaurant_id = ? AND id = ? AND row_version = ?`,
+        [...params, actorId, restaurantId, employeeId, body.expectedVersion]
+      );
+      if (updateRes.affectedRows === 0) {
+        throw new AppError(412, 'ROW_VERSION_CONFLICT', 'Employee record was modified by another administrator');
+      }
+
+      const positionChanged = body.positionId !== undefined && String(cur.position_id) !== body.positionId;
+      const endChanged = endDateProvided && (cur.employment_end_date ?? null) !== (body.employmentEndDate ?? null);
+      if (positionChanged || endChanged) {
+        const startMonth = `${String(cur.employment_start_date).slice(0, 7)}-01`;
+        await bumpSourceRevision(conn, restaurantId, startMonth);
+      }
+
+      await recordAuditEvent(
+        {
+          restaurantId,
+          actorId,
+          actorKind: req.tenantContext!.accountKind,
+          action: 'UPDATE_EMPLOYEE',
+          entityType: 'EMPLOYEE',
+          entityId: employeeId,
+          requestId: req.requestId,
+          beforeValues: {
+            fullName: cur.full_name,
+            mobile: cur.mobile,
+            positionId: String(cur.position_id),
+            employmentEndDate: cur.employment_end_date,
+          },
+          afterValues: {
+            fullName: body.fullName,
+            mobile: body.mobile,
+            positionId: body.positionId,
+            employmentEndDate: endDateProvided ? body.employmentEndDate : undefined,
+          },
+        },
+        conn
+      );
+    });
 
     res.json({
       data: { message: 'Employee updated successfully' },
@@ -318,26 +392,42 @@ employeeRouter.patch('/:employeeId/status', async (req: Request, res: Response, 
       throw new AppError(422, 'INVALID_INPUT', 'Status must be ACTIVE or INACTIVE and expectedVersion is required');
     }
 
-    const [updateRes] = await pool.execute<ResultSetHeader>(
-      `UPDATE employees 
-       SET status = ?, row_version = row_version + 1, updated_by = ?
-       WHERE restaurant_id = ? AND id = ? AND row_version = ?`,
-      [status, actorId, restaurantId, employeeId, expectedVersion]
-    );
+    await withTransaction(async (conn) => {
+      const [updateRes] = await conn.execute<ResultSetHeader>(
+        `UPDATE employees
+         SET status = ?, row_version = row_version + 1, updated_by = ?
+         WHERE restaurant_id = ? AND id = ? AND row_version = ?`,
+        [status, actorId, restaurantId, employeeId, expectedVersion]
+      );
 
-    if (updateRes.affectedRows === 0) {
-      throw new AppError(412, 'ROW_VERSION_CONFLICT', 'Employee record was modified by another administrator');
-    }
+      if (updateRes.affectedRows === 0) {
+        const [exists] = await conn.execute<RowDataPacket[]>(
+          `SELECT id FROM employees WHERE restaurant_id = ? AND id = ?`,
+          [restaurantId, employeeId]
+        );
+        if (exists.length === 0) throw new AppError(404, 'EMPLOYEE_NOT_FOUND', 'Employee not found');
+        throw new AppError(412, 'ROW_VERSION_CONFLICT', 'Employee record was modified by another administrator');
+      }
 
-    await recordAuditEvent({
-      restaurantId,
-      actorId,
-      actorKind: req.tenantContext!.accountKind,
-      action: status === 'ACTIVE' ? 'ACTIVATE_EMPLOYEE' : 'DEACTIVATE_EMPLOYEE',
-      entityType: 'EMPLOYEE',
-      entityId: employeeId,
-      requestId: req.requestId,
-      afterValues: { status },
+      const [startRows] = await conn.execute<RowDataPacket[]>(
+        `SELECT DATE_FORMAT(employment_start_date, '%Y-%m-01') AS start_month FROM employees WHERE restaurant_id = ? AND id = ?`,
+        [restaurantId, employeeId]
+      );
+      await bumpSourceRevision(conn, restaurantId, startRows[0]!.start_month);
+
+      await recordAuditEvent(
+        {
+          restaurantId,
+          actorId,
+          actorKind: req.tenantContext!.accountKind,
+          action: status === 'ACTIVE' ? 'ACTIVATE_EMPLOYEE' : 'DEACTIVATE_EMPLOYEE',
+          entityType: 'EMPLOYEE',
+          entityId: employeeId,
+          requestId: req.requestId,
+          afterValues: { status },
+        },
+        conn
+      );
     });
 
     res.json({
@@ -388,59 +478,67 @@ employeeRouter.get('/:employeeId/salary-history', async (req: Request, res: Resp
   }
 });
 
-// POST /api/v1/restaurants/:restaurantId/employees/:employeeId/salary-versions
-employeeRouter.post('/:employeeId/salary-versions', async (req: Request, res: Response, next: NextFunction) => {
+const salaryVersionBodySchema = createSalaryVersionSchema.extend({
+  effectiveFromMonth: z.string().regex(/^\d{4}-(0[1-9]|1[0-2])(-01)?$/, 'effectiveFromMonth must be YYYY-MM or YYYY-MM-01'),
+});
+
+// POST /api/v1/restaurants/:restaurantId/employees/:employeeId/salaries  (alias: /salary-versions)
+const createSalaryVersion = async (req: Request, res: Response, next: NextFunction) => {
   try {
     const restaurantId = req.tenantContext!.restaurantId;
     const employeeId = String(req.params.employeeId);
     const actorId = req.tenantContext!.actorId;
-    const body = createSalaryVersionSchema.parse(req.body);
+    const body = salaryVersionBodySchema.parse(req.body);
+    const effectiveFromMonth = normalizeMonthStart(body.effectiveFromMonth, 'effectiveFromMonth');
 
-    const [latest] = await pool.execute<RowDataPacket[]>(
-      `SELECT revision_no FROM employee_salary_versions 
-       WHERE restaurant_id = ? AND employee_id = ? AND effective_from_month = ? 
-       ORDER BY revision_no DESC LIMIT 1`,
-      [restaurantId, employeeId, body.effectiveFromMonth]
-    );
-    const nextRevision = latest[0] ? Number(latest[0].revision_no) + 1 : 1;
+    const result = await withTransaction(async (conn) => {
+      // Lock the employee row to serialize revision numbering
+      const [empRows] = await conn.execute<RowDataPacket[]>(
+        `SELECT id FROM employees WHERE restaurant_id = ? AND id = ? FOR UPDATE`,
+        [restaurantId, employeeId]
+      );
+      if (empRows.length === 0) throw new AppError(404, 'EMPLOYEE_NOT_FOUND', 'Employee not found');
 
-    const [insertRes] = await pool.execute<ResultSetHeader>(
-      `INSERT INTO employee_salary_versions 
-        (restaurant_id, employee_id, effective_from_month, revision_no, monthly_salary, reason, created_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [
-        restaurantId,
-        employeeId,
-        body.effectiveFromMonth,
-        nextRevision,
-        body.monthlySalary,
-        body.reason,
-        actorId,
-      ]
-    );
+      await assertMonthNotFinalized(conn, restaurantId, effectiveFromMonth);
 
-    // Invalidate/increment payroll source revision
-    await pool.execute(
-      `UPDATE payroll_periods SET source_revision = source_revision + 1 
-       WHERE restaurant_id = ? AND month_start >= ?`,
-      [restaurantId, body.effectiveFromMonth]
-    );
+      const [latest] = await conn.execute<RowDataPacket[]>(
+        `SELECT revision_no FROM employee_salary_versions
+         WHERE restaurant_id = ? AND employee_id = ? AND effective_from_month = ?
+         ORDER BY revision_no DESC LIMIT 1`,
+        [restaurantId, employeeId, effectiveFromMonth]
+      );
+      const nextRevision = latest[0] ? Number(latest[0].revision_no) + 1 : 1;
 
-    await recordAuditEvent({
-      restaurantId,
-      actorId,
-      actorKind: req.tenantContext!.accountKind,
-      action: 'UPDATE_EMPLOYEE_SALARY',
-      entityType: 'EMPLOYEE_SALARY',
-      entityId: String(insertRes.insertId),
-      requestId: req.requestId,
-      afterValues: body,
+      const [insertRes] = await conn.execute<ResultSetHeader>(
+        `INSERT INTO employee_salary_versions
+          (restaurant_id, employee_id, effective_from_month, revision_no, monthly_salary, reason, created_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [restaurantId, employeeId, effectiveFromMonth, nextRevision, body.monthlySalary, body.reason, actorId]
+      );
+
+      // Only non-finalized periods from the effective month onward are affected
+      await bumpSourceRevision(conn, restaurantId, effectiveFromMonth);
+
+      await recordAuditEvent(
+        {
+          restaurantId,
+          actorId,
+          actorKind: req.tenantContext!.accountKind,
+          action: 'UPDATE_EMPLOYEE_SALARY',
+          entityType: 'EMPLOYEE_SALARY',
+          entityId: String(insertRes.insertId),
+          requestId: req.requestId,
+          afterValues: { ...body, effectiveFromMonth, employeeId },
+        },
+        conn
+      );
+      return { id: insertRes.insertId, revisionNo: nextRevision };
     });
 
     res.status(201).json({
       data: {
-        id: String(insertRes.insertId),
-        revisionNo: nextRevision,
+        id: String(result.id),
+        revisionNo: result.revisionNo,
         message: 'New salary version created successfully',
       },
       meta: { requestId: req.requestId },
@@ -448,4 +546,6 @@ employeeRouter.post('/:employeeId/salary-versions', async (req: Request, res: Re
   } catch (err) {
     next(err);
   }
-});
+};
+employeeRouter.post('/:employeeId/salaries', createSalaryVersion);
+employeeRouter.post('/:employeeId/salary-versions', createSalaryVersion);

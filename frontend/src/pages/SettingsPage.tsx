@@ -1,7 +1,8 @@
+import { nextMonthStart } from '../lib/format';
 import React, { useState } from 'react';
 import { useParams } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { configApi, platformApi } from '../lib/api';
+import { configApi, restaurantApi } from '../lib/api';
 import {
   Scale,
   Briefcase,
@@ -15,7 +16,7 @@ import {
 } from 'lucide-react';
 
 export const SettingsPage: React.FC = () => {
-  const { restaurantId = '1' } = useParams<{ restaurantId: string }>();
+  const { restaurantId = '' } = useParams<{ restaurantId: string }>();
   const queryClient = useQueryClient();
 
   const [activeTab, setActiveTab] = useState<'POLICY' | 'POSITIONS' | 'DEDUCTIONS' | 'TEMPLATES' | 'ADMINS'>('POLICY');
@@ -24,7 +25,7 @@ export const SettingsPage: React.FC = () => {
 
   // Policy Form
   const [policyForm, setPolicyForm] = useState({
-    effectiveFromMonth: '2026-10-01',
+    effectiveFromMonth: nextMonthStart(),
     salaryWorkingDayDivisor: 26,
     standardDailyMinutes: 480,
     overtimeMultiplier: 1.5,
@@ -55,7 +56,7 @@ export const SettingsPage: React.FC = () => {
 
   const { data: restaurant } = useQuery({
     queryKey: ['restaurant-info', restaurantId],
-    queryFn: () => platformApi.getRestaurant(restaurantId),
+    queryFn: () => restaurantApi.getProfile(restaurantId),
   });
 
   const { data: policies = [] } = useQuery({
@@ -137,15 +138,15 @@ export const SettingsPage: React.FC = () => {
   return (
     <div>
       <div style={{ marginBottom: '1.75rem' }}>
-        <h1 style={{ fontSize: '1.75rem', fontWeight: 700, letterSpacing: '-0.02em' }}>
-          Restaurant Policies & Configuration
+        <h1 className="page-title">
+          Settings & policy
         </h1>
-        <p style={{ color: 'var(--text-muted)', fontSize: '0.875rem', marginTop: '0.25rem' }}>
+        <p className="page-subtitle">
           Versioned business rules, shift catalogs, job positions, and administrator access control.
         </p>
       </div>
 
-      {modalError && (
+      {modalError && !modalType && (
         <div
           style={{
             display: 'flex',
@@ -155,7 +156,7 @@ export const SettingsPage: React.FC = () => {
             backgroundColor: 'var(--status-danger-bg)',
             border: '1px solid var(--status-danger-border)',
             borderRadius: 'var(--radius-lg)',
-            color: '#991b1b',
+            color: 'var(--status-danger-text)',
             fontSize: '0.875rem',
             marginBottom: '1.5rem',
           }}
@@ -250,7 +251,7 @@ export const SettingsPage: React.FC = () => {
                       <td className="tabular-nums mono">{p.standardDailyMinutes / 60}h ({p.standardDailyMinutes}m)</td>
                       <td className="tabular-nums mono" style={{ fontWeight: 600 }}>{p.overtimeMultiplier}x</td>
                       <td className="tabular-nums mono">{p.lateGraceMinutes} mins</td>
-                      <td className="tabular-nums mono" style={{ color: '#dc2626' }}>{p.lateDeductionPercentage}%</td>
+                      <td className="tabular-nums mono" style={{ color: 'var(--status-danger)' }}>{p.lateDeductionPercentage}%</td>
                       <td className="tabular-nums mono" style={{ fontWeight: 600 }}>{p.warningThreshold} warnings</td>
                       <td style={{ fontSize: '0.8125rem' }}>{p.reason}</td>
                     </tr>
@@ -451,6 +452,25 @@ export const SettingsPage: React.FC = () => {
             <div className="modal-header">
               <h2 className="modal-title">Enact New Policy Version</h2>
             </div>
+            {modalError && (
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '0.5rem',
+                  padding: '0.75rem',
+                  backgroundColor: 'var(--status-danger-bg)',
+                  border: '1px solid var(--status-danger-border)',
+                  borderRadius: 'var(--radius-md)',
+                  color: 'var(--status-danger-text)',
+                  fontSize: '0.8125rem',
+                  marginBottom: '1rem',
+                }}
+              >
+                <AlertCircle size={16} />
+                <span>{modalError}</span>
+              </div>
+            )}
             <form onSubmit={(e) => { e.preventDefault(); createPolicyMutation.mutate(policyForm); }}>
               <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
                 <div className="form-group">
@@ -469,6 +489,7 @@ export const SettingsPage: React.FC = () => {
                     <input
                       type="number"
                       className="input"
+                      required
                       value={policyForm.salaryWorkingDayDivisor}
                       onChange={(e) => setPolicyForm({ ...policyForm, salaryWorkingDayDivisor: Number(e.target.value) })}
                     />
@@ -479,6 +500,7 @@ export const SettingsPage: React.FC = () => {
                       type="number"
                       step="0.05"
                       className="input"
+                      required
                       value={policyForm.overtimeMultiplier}
                       onChange={(e) => setPolicyForm({ ...policyForm, overtimeMultiplier: Number(e.target.value) })}
                     />
@@ -490,6 +512,7 @@ export const SettingsPage: React.FC = () => {
                     <input
                       type="number"
                       className="input"
+                      required
                       value={policyForm.lateGraceMinutes}
                       onChange={(e) => setPolicyForm({ ...policyForm, lateGraceMinutes: Number(e.target.value) })}
                     />
@@ -500,6 +523,7 @@ export const SettingsPage: React.FC = () => {
                       type="number"
                       step="1"
                       className="input"
+                      required
                       value={policyForm.lateDeductionPercentage}
                       onChange={(e) => setPolicyForm({ ...policyForm, lateDeductionPercentage: Number(e.target.value) })}
                     />
@@ -510,6 +534,7 @@ export const SettingsPage: React.FC = () => {
                   <input
                     type="number"
                     className="input"
+                    required
                     value={policyForm.warningThreshold}
                     onChange={(e) => setPolicyForm({ ...policyForm, warningThreshold: Number(e.target.value) })}
                   />
@@ -541,6 +566,25 @@ export const SettingsPage: React.FC = () => {
             <div className="modal-header">
               <h2 className="modal-title">Create Job Position</h2>
             </div>
+            {modalError && (
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '0.5rem',
+                  padding: '0.75rem',
+                  backgroundColor: 'var(--status-danger-bg)',
+                  border: '1px solid var(--status-danger-border)',
+                  borderRadius: 'var(--radius-md)',
+                  color: 'var(--status-danger-text)',
+                  fontSize: '0.8125rem',
+                  marginBottom: '1rem',
+                }}
+              >
+                <AlertCircle size={16} />
+                <span>{modalError}</span>
+              </div>
+            )}
             <form onSubmit={(e) => { e.preventDefault(); createPositionMutation.mutate(positionTitle); }}>
               <div className="form-group">
                 <label className="form-label">Position Title</label>
@@ -569,6 +613,25 @@ export const SettingsPage: React.FC = () => {
             <div className="modal-header">
               <h2 className="modal-title">Create Deduction Type</h2>
             </div>
+            {modalError && (
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '0.5rem',
+                  padding: '0.75rem',
+                  backgroundColor: 'var(--status-danger-bg)',
+                  border: '1px solid var(--status-danger-border)',
+                  borderRadius: 'var(--radius-md)',
+                  color: 'var(--status-danger-text)',
+                  fontSize: '0.8125rem',
+                  marginBottom: '1rem',
+                }}
+              >
+                <AlertCircle size={16} />
+                <span>{modalError}</span>
+              </div>
+            )}
             <form onSubmit={(e) => { e.preventDefault(); createDeductionMutation.mutate(deductionForm); }}>
               <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
                 <div className="form-group">
@@ -623,6 +686,25 @@ export const SettingsPage: React.FC = () => {
             <div className="modal-header">
               <h2 className="modal-title">Add Restaurant Administrator</h2>
             </div>
+            {modalError && (
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '0.5rem',
+                  padding: '0.75rem',
+                  backgroundColor: 'var(--status-danger-bg)',
+                  border: '1px solid var(--status-danger-border)',
+                  borderRadius: 'var(--radius-md)',
+                  color: 'var(--status-danger-text)',
+                  fontSize: '0.8125rem',
+                  marginBottom: '1rem',
+                }}
+              >
+                <AlertCircle size={16} />
+                <span>{modalError}</span>
+              </div>
+            )}
             <form onSubmit={(e) => { e.preventDefault(); createAdminMutation.mutate(adminForm); }}>
               <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
                 <div className="form-group">
@@ -665,6 +747,7 @@ export const SettingsPage: React.FC = () => {
                     type="password"
                     className="input"
                     required
+                    minLength={8}
                     placeholder="Min 8 characters"
                     value={adminForm.password}
                     onChange={(e) => setAdminForm({ ...adminForm, password: e.target.value })}

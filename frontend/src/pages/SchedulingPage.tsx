@@ -1,3 +1,5 @@
+import { usePeriod } from '../context/PeriodContext';
+import { currentMonth, monthStart, monthEnd } from '../lib/format';
 import React, { useState } from 'react';
 import { useParams } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
@@ -8,10 +10,10 @@ import {
 } from 'lucide-react';
 
 export const SchedulingPage: React.FC = () => {
-  const { restaurantId = '1' } = useParams<{ restaurantId: string }>();
+  const { restaurantId = '' } = useParams<{ restaurantId: string }>();
   const queryClient = useQueryClient();
 
-  const [selectedMonth, setSelectedMonth] = useState('2026-09');
+  const { month: selectedMonth } = usePeriod();
   const [showBulkModal, setShowBulkModal] = useState(false);
   const [previewResult, setPreviewResult] = useState<any | null>(null);
   const [modalError, setModalError] = useState<string | null>(null);
@@ -19,10 +21,11 @@ export const SchedulingPage: React.FC = () => {
   // Bulk Generator State
   const [bulkForm, setBulkForm] = useState({
     employeeIds: [] as string[],
-    startDate: '2026-09-01',
-    endDate: '2026-09-30',
+    startDate: monthStart(currentMonth()),
+    endDate: monthEnd(currentMonth()),
     shiftTemplateId: '',
     dayType: 'WORK' as 'WORK' | 'OFF',
+    weekdays: [1, 2, 3, 4, 5, 6, 7] as number[],
     overwriteExisting: true,
   });
 
@@ -84,27 +87,17 @@ export const SchedulingPage: React.FC = () => {
 
   return (
     <div>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '1.75rem', flexWrap: 'wrap', gap: '1rem' }}>
+      <div className="page-header">
         <div>
-          <h1 style={{ fontSize: '1.75rem', fontWeight: 700, letterSpacing: '-0.02em' }}>
-            Shift Scheduling Matrix
+          <h1 className="page-title">
+            Schedule
           </h1>
-          <p style={{ color: 'var(--text-muted)', fontSize: '0.875rem', marginTop: '0.25rem' }}>
+          <p className="page-subtitle">
             Monthly calendar grid of planned shifts, interval requirements, and multi-staff bulk assignment.
           </p>
         </div>
 
         <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
-            <span style={{ fontSize: '0.8125rem', color: 'var(--text-muted)' }}>Month:</span>
-            <input
-              type="month"
-              className="input"
-              value={selectedMonth}
-              onChange={(e) => setSelectedMonth(e.target.value)}
-              style={{ width: 'auto', padding: '0.4rem 0.6rem' }}
-            />
-          </div>
 
           <button className="btn btn-primary" onClick={() => { setModalError(null); setPreviewResult(null); setShowBulkModal(true); }}>
             <Sparkles size={16} />
@@ -117,19 +110,19 @@ export const SchedulingPage: React.FC = () => {
       <div className="card" style={{ padding: '0.75rem 1.25rem', marginBottom: '1rem', display: 'flex', alignItems: 'center', gap: '1.5rem', flexWrap: 'wrap' }}>
         <div style={{ fontSize: '0.8125rem', fontWeight: 600, color: 'var(--text-muted)' }}>Shift Legend:</div>
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.75rem' }}>
-          <span style={{ width: 12, height: 12, borderRadius: 3, backgroundColor: '#0f766e' }} />
+          <span style={{ width: 12, height: 12, borderRadius: 3, backgroundColor: 'var(--primary)' }} />
           <span>Morning (08:00 - 16:30, 480m)</span>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.75rem' }}>
-          <span style={{ width: 12, height: 12, borderRadius: 3, backgroundColor: '#4338ca' }} />
+          <span style={{ width: 12, height: 12, borderRadius: 3, backgroundColor: 'var(--accent)' }} />
           <span>Evening (16:00 - 00:30, 480m)</span>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.75rem' }}>
-          <span style={{ width: 12, height: 12, borderRadius: 3, backgroundColor: '#b45309' }} />
+          <span style={{ width: 12, height: 12, borderRadius: 3, backgroundColor: 'var(--status-warning)' }} />
           <span>Split Lunch/Dinner (480m)</span>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.75rem' }}>
-          <span style={{ width: 12, height: 12, borderRadius: 3, backgroundColor: '#e2e8f0', border: '1px solid #cbd5e1' }} />
+          <span style={{ width: 12, height: 12, borderRadius: 3, backgroundColor: 'var(--border-light)', border: '1px solid var(--border-strong)' }} />
           <span>Day Off (0m)</span>
         </div>
       </div>
@@ -156,8 +149,8 @@ export const SchedulingPage: React.FC = () => {
                         textAlign: 'center',
                         minWidth: 40,
                         padding: '0.4rem 0.2rem',
-                        backgroundColor: isWeekend ? '#fee2e2' : undefined,
-                        color: isWeekend ? '#991b1b' : undefined,
+                        backgroundColor: isWeekend ? 'var(--status-danger-bg)' : undefined,
+                        color: isWeekend ? 'var(--status-danger-text)' : undefined,
                       }}
                     >
                       <div>{dayName}</div>
@@ -204,31 +197,31 @@ export const SchedulingPage: React.FC = () => {
                       const workDate = `${selectedMonth}-${dStr}`;
                       const cell = scheduleMap.get(`${emp.id}_${workDate}`);
 
-                      let bg = '#f8fafc';
+                      let bg = 'var(--bg-surface-subtle)';
                       let label = '-';
-                      let color = '#94a3b8';
+                      let color = 'var(--text-subtle)';
 
                       if (cell) {
                         if (cell.dayType === 'OFF') {
-                          bg = '#e2e8f0';
+                          bg = 'var(--border-light)';
                           label = 'OFF';
-                          color = '#64748b';
+                          color = 'var(--text-muted)';
                         } else if (cell.templateName?.includes('Morning') || cell.templateName?.includes('Main')) {
-                          bg = '#ccfbf1';
+                          bg = 'var(--primary-light)';
                           label = 'MORN';
-                          color = '#0f766e';
+                          color = 'var(--primary)';
                         } else if (cell.templateName?.includes('Evening')) {
-                          bg = '#e0e7ff';
+                          bg = 'var(--accent-light)';
                           label = 'EVE';
-                          color = '#4338ca';
+                          color = 'var(--accent)';
                         } else if (cell.templateName?.includes('Split')) {
-                          bg = '#fef3c7';
+                          bg = 'var(--status-warning-bg)';
                           label = 'SPLIT';
-                          color = '#b45309';
+                          color = 'var(--status-warning)';
                         } else {
-                          bg = '#dbeafe';
+                          bg = 'var(--status-info-bg)';
                           label = 'WORK';
-                          color = '#1e40af';
+                          color = 'var(--status-info-text)';
                         }
                       }
 
@@ -238,7 +231,7 @@ export const SchedulingPage: React.FC = () => {
                           style={{
                             textAlign: 'center',
                             padding: '0.25rem',
-                            borderRight: '1px solid #f1f5f9',
+                            borderRight: '1px solid var(--border-subtle)',
                           }}
                         >
                           <div
@@ -282,7 +275,7 @@ export const SchedulingPage: React.FC = () => {
                   backgroundColor: 'var(--status-danger-bg)',
                   border: '1px solid var(--status-danger-border)',
                   borderRadius: 'var(--radius-md)',
-                  color: '#991b1b',
+                  color: 'var(--status-danger-text)',
                   fontSize: '0.8125rem',
                   marginBottom: '1rem',
                 }}
@@ -368,6 +361,32 @@ export const SchedulingPage: React.FC = () => {
                   </div>
                 </div>
 
+                <div className="form-group">
+                  <label className="form-label">Apply on</label>
+                  <div className="segmented" style={{ alignSelf: 'flex-start', flexWrap: 'wrap' }}>
+                    {['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'].map((label, i) => {
+                      const day = i + 1;
+                      const on = bulkForm.weekdays.includes(day);
+                      return (
+                        <button
+                          type="button"
+                          key={label}
+                          className={on ? 'active' : ''}
+                          onClick={() =>
+                            setBulkForm({
+                              ...bulkForm,
+                              weekdays: on ? bulkForm.weekdays.filter((d) => d !== day) : [...bulkForm.weekdays, day].sort(),
+                            })
+                          }
+                        >
+                          {label}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <span className="form-hint">Only the selected weekdays inside the date range are generated.</span>
+                </div>
+
                 <div className="grid-2">
                   <div className="form-group">
                     <label className="form-label">Day Classification</label>
@@ -412,7 +431,7 @@ export const SchedulingPage: React.FC = () => {
                       fontSize: '0.8125rem',
                     }}
                   >
-                    <div style={{ fontWeight: 600, color: '#1e3a8a', marginBottom: '0.25rem' }}>
+                    <div style={{ fontWeight: 600, color: 'var(--status-info-text)', marginBottom: '0.25rem' }}>
                       Generation Plan Ready
                     </div>
                     <div>

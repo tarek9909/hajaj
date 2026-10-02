@@ -13,7 +13,10 @@ export const pool: Pool = mysql.createPool({
   connectionLimit: 20,
   queueLimit: 0,
   timezone: '+00:00',
-  multipleStatements: true,
+});
+
+pool.pool.on('connection', (connection) => {
+  connection.query("SET time_zone = '+00:00'");
 });
 
 /**

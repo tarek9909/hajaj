@@ -1,3 +1,5 @@
+import { currentMonth } from '../lib/format';
+import { Modal, Alert } from '../components/ui';
 import React, { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useNavigate } from 'react-router-dom';
@@ -21,6 +23,7 @@ export const PlatformDashboardPage: React.FC = () => {
 
   const [showModal, setShowModal] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
+  const [statusError, setStatusError] = useState<string | null>(null);
 
   // Form State for Onboarding
   const [formData, setFormData] = useState({
@@ -31,7 +34,7 @@ export const PlatformDashboardPage: React.FC = () => {
     currencyCode: 'USD',
     currencyDecimalPlaces: 2,
     timezone: 'UTC',
-    payrollStartMonth: '2026-10-01',
+    payrollStartMonth: `${currentMonth()}-01`,
     initialPolicy: {
       salaryWorkingDayDivisor: 26,
       standardDailyMinutes: 480,
@@ -50,16 +53,27 @@ export const PlatformDashboardPage: React.FC = () => {
     },
   });
 
+  const [handoff, setHandoff] = useState<{ restaurantId: string; link: string } | null>(null);
+
   const { data: restaurants = [], isLoading } = useQuery({
     queryKey: ['platform-restaurants'],
     queryFn: () => platformApi.listRestaurants(),
   });
 
   const onboardMutation = useMutation({
-    mutationFn: (data: typeof formData) => platformApi.onboardRestaurant(data),
+    mutationFn: (data: typeof formData) => {
+      const { password, ...admin } = data.initialAdmin;
+      return platformApi.onboardRestaurant({ ...data, initialAdmin: password ? { ...admin, password } : admin });
+    },
     onSuccess: (res) => {
       queryClient.invalidateQueries({ queryKey: ['platform-restaurants'] });
+      queryClient.invalidateQueries({ queryKey: ['platform-restaurants-switcher'] });
       setShowModal(false);
+      if (res.setupPath) {
+        // No password was set: the admin needs this one-time link to activate the account
+        setHandoff({ restaurantId: res.restaurantId, link: `${window.location.origin}${res.setupPath}` });
+        return;
+      }
       setActiveRestaurantId(res.restaurantId);
       navigate(`/restaurants/${res.restaurantId}/dashboard`);
     },
@@ -72,6 +86,11 @@ export const PlatformDashboardPage: React.FC = () => {
     mutationFn: ({ id, status, version }: { id: string; status: 'ACTIVE' | 'INACTIVE'; version: number }) =>
       platformApi.updateStatus(id, status, version),
     onSuccess: () => {
+      setStatusError(null);
+      queryClient.invalidateQueries({ queryKey: ['platform-restaurants'] });
+    },
+    onError: (err: any) => {
+      setStatusError(err.message || 'Failed to change restaurant status');
       queryClient.invalidateQueries({ queryKey: ['platform-restaurants'] });
     },
   });
@@ -88,18 +107,20 @@ export const PlatformDashboardPage: React.FC = () => {
     <div>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '1.75rem' }}>
         <div>
-          <h1 style={{ fontSize: '1.75rem', fontWeight: 700, color: 'var(--text-main)', letterSpacing: '-0.02em' }}>
-            Platform Control Console
+          <h1 className="page-title">
+            Restaurants
           </h1>
-          <p style={{ color: 'var(--text-muted)', fontSize: '0.875rem', marginTop: '0.25rem' }}>
+          <p className="page-subtitle">
             Manage SaaS restaurant tenants, global policies, and root administrators.
           </p>
         </div>
-        <button className="btn btn-primary" onClick={() => setShowModal(true)}>
+        <button className="btn btn-primary" onClick={() => { setFormError(null); setShowModal(true); }}>
           <Plus size={18} />
           <span>Onboard Restaurant</span>
         </button>
       </div>
+
+      {statusError && <Alert tone="danger" style={{ marginBottom: '1rem' }}>{statusError}</Alert>}
 
       {/* Metrics Row */}
       <div className="grid-3" style={{ marginBottom: '2rem' }}>
@@ -263,7 +284,7 @@ export const PlatformDashboardPage: React.FC = () => {
                   backgroundColor: 'var(--status-danger-bg)',
                   border: '1px solid var(--status-danger-border)',
                   borderRadius: 'var(--radius-md)',
-                  color: '#991b1b',
+                  color: 'var(--status-danger-text)',
                   fontSize: '0.8125rem',
                   marginBottom: '1rem',
                 }}
@@ -344,6 +365,7 @@ export const PlatformDashboardPage: React.FC = () => {
                     <input
                       type="number"
                       className="input"
+                      required
                       value={formData.initialPolicy.salaryWorkingDayDivisor}
                       onChange={(e) =>
                         setFormData({
@@ -358,6 +380,7 @@ export const PlatformDashboardPage: React.FC = () => {
                     <input
                       type="number"
                       className="input"
+                      required
                       value={formData.initialPolicy.standardDailyMinutes}
                       onChange={(e) =>
                         setFormData({
@@ -390,6 +413,7 @@ export const PlatformDashboardPage: React.FC = () => {
                     <input
                       type="number"
                       className="input"
+                      required
                       value={formData.initialPolicy.lateGraceMinutes}
                       onChange={(e) =>
                         setFormData({
@@ -419,6 +443,7 @@ export const PlatformDashboardPage: React.FC = () => {
                     <input
                       type="number"
                       className="input"
+                      required
                       value={formData.initialPolicy.warningThreshold}
                       onChange={(e) =>
                         setFormData({
@@ -469,12 +494,12 @@ export const PlatformDashboardPage: React.FC = () => {
                 </div>
 
                 <div className="form-group">
-                  <label className="form-label">Initial Password</label>
+                  <label className="form-label">Initial Password (optional)</label>
                   <input
                     type="password"
                     className="input"
-                    required
-                    placeholder="Min 8 characters"
+                    minLength={8}
+                    placeholder="Leave blank to send a secure setup link"
                     value={formData.initialAdmin.password}
                     onChange={(e) =>
                       setFormData({
@@ -497,6 +522,25 @@ export const PlatformDashboardPage: React.FC = () => {
             </form>
           </div>
         </div>
+      )}
+
+      {handoff && (
+        <Modal title="Share the setup link" onClose={() => setHandoff(null)}>
+          <Alert tone="warning">This link is shown once and expires in 48 hours. Send it to the administrator securely.</Alert>
+          <input className="input mono" readOnly value={handoff.link} onFocus={(e) => e.currentTarget.select()} />
+          <div className="modal-footer">
+            <button className="btn btn-secondary" onClick={() => navigator.clipboard?.writeText(handoff.link)}>Copy link</button>
+            <button
+              className="btn btn-primary"
+              onClick={() => {
+                setActiveRestaurantId(handoff.restaurantId);
+                navigate(`/restaurants/${handoff.restaurantId}/dashboard`);
+              }}
+            >
+              Open workspace
+            </button>
+          </div>
+        </Modal>
       )}
     </div>
   );

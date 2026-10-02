@@ -15,11 +15,15 @@ export interface DailyCalculationInput {
   dayType: 'WORK' | 'OFF' | 'EXCUSED';
   requiredMinutes: number;
   isResolved: boolean;
+  /** When explicitly false, time worked beyond the requirement is not counted (extra time must be approved). */
+  additionalWorkApproved?: boolean;
   attendanceStatus: 'OFF' | 'NOT_RECORDED' | 'IN_PROGRESS' | 'COMPLETED' | 'CONFIRMED_ABSENT' | 'EXCUSED' | 'NEEDS_REVIEW';
   plannedIntervals: Array<{
     sequenceNumber: number;
     startLocalTime: string; // HH:mm or ISO
     endLocalTime: string;
+    /** Absolute planned start (ISO with offset); authoritative for lateness when present. */
+    startAt?: string;
   }>;
   actualIntervals: Array<{
     sequenceNumber: number;

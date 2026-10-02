@@ -1,9 +1,10 @@
-import { randomBytes } from 'node:crypto';
-import { Router, type Request, type Response, type NextFunction } from 'express';
-import type { RowDataPacket } from 'mysql2/promise';
-import { pool } from '../../infrastructure/database/pool.js';
+import { Router, type CookieOptions, type Request, type Response, type NextFunction } from 'express';
+import type { PoolConnection, RowDataPacket, ResultSetHeader } from 'mysql2/promise';
+import { pool, withTransaction } from '../../infrastructure/database/pool.js';
 import { verifyPassword, hashPassword } from '../../infrastructure/auth/passwords.js';
-import { SessionManager, hashToken } from '../../infrastructure/sessions/sessionManager.js';
+import { SessionManager, hashToken, deriveCsrfToken } from '../../infrastructure/sessions/sessionManager.js';
+import { issueAccountToken } from '../../infrastructure/email/accountLinks.js';
+import { recordAuditEvent, type AuditParams } from '../../infrastructure/logging/audit.js';
 import { authenticateSession, requireCsrfProtection } from '../../middleware/tenantContext.js';
 import {
   loginSchema,
@@ -14,6 +15,86 @@ import {
 import { AppError } from '../../middleware/errorHandler.js';
 
 export const authRouter = Router();
+
+const MAX_FAILED_LOGINS = 10;
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const failedLogins = new Map<string, { count: number; resetAt: number }>();
+
+function isRateLimited(key: string): boolean {
+  const entry = failedLogins.get(key);
+  if (!entry) return false;
+  if (entry.resetAt <= Date.now()) {
+    failedLogins.delete(key);
+    return false;
+  }
+  return entry.count >= MAX_FAILED_LOGINS;
+}
+
+function registerFailure(key: string): void {
+  const now = Date.now();
+  const entry = failedLogins.get(key);
+  if (!entry || entry.resetAt <= now) {
+    if (failedLogins.size > 10000) {
+      for (const [k, v] of failedLogins) if (v.resetAt <= now) failedLogins.delete(k);
+    }
+    failedLogins.set(key, { count: 1, resetAt: now + LOGIN_WINDOW_MS });
+  } else {
+    entry.count += 1;
+  }
+}
+
+function clearFailures(key: string): void {
+  failedLogins.delete(key);
+}
+
+let dummyHash: Promise<string> | null = null;
+function getDummyHash(): Promise<string> {
+  dummyHash ??= hashPassword('dummy-password-for-timing-equalization');
+  return dummyHash;
+}
+
+function sessionCookieName(): string {
+  return process.env.NODE_ENV === 'production' ? '__Host-session' : 'session_token';
+}
+
+function sessionCookieOptions(): CookieOptions {
+  return {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'lax',
+    path: '/',
+  };
+}
+
+async function safeAudit(params: AuditParams): Promise<void> {
+  try {
+    await recordAuditEvent(params);
+  } catch (err) {
+    console.error('Failed to record audit event:', err);
+  }
+}
+
+async function consumeAccountToken(
+  conn: PoolConnection,
+  tokenHash: Buffer,
+  purpose: 'PASSWORD_SETUP' | 'PASSWORD_RESET'
+): Promise<RowDataPacket | null> {
+  const [claim] = await conn.execute<ResultSetHeader>(
+    `UPDATE account_tokens SET used_at = NOW(3)
+     WHERE token_hash = ? AND purpose = ? AND used_at IS NULL AND expires_at > NOW(3)`,
+    [tokenHash, purpose]
+  );
+  if (claim.affectedRows !== 1) return null;
+
+  const [rows] = await conn.execute<RowDataPacket[]>(
+    `SELECT a.id, a.restaurant_id, a.account_kind, a.status
+     FROM account_tokens t
+     JOIN admin_accounts a ON a.id = t.admin_account_id
+     WHERE t.token_hash = ?`,
+    [tokenHash]
+  );
+  return rows[0] ?? null;
+}
 
 // GET /api/v1/auth/csrf
 authRouter.get('/csrf', async (req: Request, res: Response, next: NextFunction) => {
@@ -30,20 +111,7 @@ authRouter.get('/csrf', async (req: Request, res: Response, next: NextFunction) 
       return;
     }
 
-    // Lookup session csrf token
-    const tokenHash = hashToken(sessionToken);
-    const [rows] = await pool.execute<RowDataPacket[]>(
-      `SELECT csrf_token_hash FROM sessions WHERE token_hash = ? AND revoked_at IS NULL`,
-      [tokenHash]
-    );
-
-    // If session valid, provide a CSRF token
-    // In our implementation, csrfToken is returned on login and can be regenerated or fetched
-    res.json({
-      data: {
-        csrfToken: req.headers['x-csrf-token'] || 'active-session-csrf-token',
-      },
-    });
+    res.json({ data: { csrfToken: deriveCsrfToken(sessionToken) } });
   } catch (err) {
     next(err);
   }
@@ -54,16 +122,35 @@ authRouter.post('/login', async (req: Request, res: Response, next: NextFunction
   try {
     const body = loginSchema.parse(req.body);
     const emailNorm = body.email.toLowerCase().trim();
+    const rateKey = `${req.ip}|${emailNorm}`;
+
+    if (isRateLimited(rateKey)) {
+      throw new AppError(429, 'TOO_MANY_ATTEMPTS', 'Too many failed login attempts. Please try again later.');
+    }
 
     const [rows] = await pool.execute<RowDataPacket[]>(
-      `SELECT id, restaurant_id, account_kind, full_name, email_normalized, password_hash, status, password_setup_required 
-       FROM admin_accounts 
+      `SELECT id, restaurant_id, account_kind, full_name, email_normalized, password_hash, status, password_setup_required
+       FROM admin_accounts
        WHERE email_normalized = ?`,
       [emailNorm]
     );
 
     const account = rows[0];
-    if (!account) {
+    const passwordMatches = account?.password_hash
+      ? await verifyPassword(body.password, account.password_hash)
+      : await verifyPassword(body.password, await getDummyHash());
+
+    if (!account || (account.password_hash && !passwordMatches)) {
+      registerFailure(rateKey);
+      await safeAudit({
+        restaurantId: account?.restaurant_id ? String(account.restaurant_id) : null,
+        actorKind: 'SYSTEM',
+        action: 'LOGIN_FAILED',
+        entityType: 'ADMIN_ACCOUNT',
+        entityId: account ? String(account.id) : null,
+        requestId: req.requestId,
+        afterValues: { email: emailNorm, ip: req.ip ?? null },
+      });
       throw new AppError(401, 'INVALID_CREDENTIALS', 'Invalid email or password');
     }
 
@@ -75,21 +162,23 @@ authRouter.post('/login', async (req: Request, res: Response, next: NextFunction
       throw new AppError(400, 'PASSWORD_SETUP_REQUIRED', 'Password setup is required for this account');
     }
 
-    const passwordMatches = await verifyPassword(body.password, account.password_hash);
-    if (!passwordMatches) {
-      throw new AppError(401, 'INVALID_CREDENTIALS', 'Invalid email or password');
-    }
+    let restaurantName: string | null = null;
+    let restaurantCurrency: string | null = null;
 
     // Check restaurant status if restaurant admin
     if (account.account_kind === 'RESTAURANT_ADMIN' && account.restaurant_id) {
       const [restRows] = await pool.execute<RowDataPacket[]>(
-        `SELECT status FROM restaurants WHERE id = ?`,
+        `SELECT name, currency_code, status FROM restaurants WHERE id = ?`,
         [account.restaurant_id]
       );
       if (!restRows[0] || restRows[0].status !== 'ACTIVE') {
         throw new AppError(403, 'RESTAURANT_INACTIVE', 'This restaurant has been deactivated');
       }
+      restaurantName = restRows[0].name;
+      restaurantCurrency = restRows[0].currency_code;
     }
+
+    clearFailures(rateKey);
 
     // Create session
     const { sessionToken, csrfToken } = await SessionManager.createSession(String(account.id));
@@ -97,15 +186,16 @@ authRouter.post('/login', async (req: Request, res: Response, next: NextFunction
     // Update last_login_at
     await pool.execute(`UPDATE admin_accounts SET last_login_at = NOW(3) WHERE id = ?`, [account.id]);
 
-    const isProduction = process.env.NODE_ENV === 'production';
-    const cookieName = isProduction ? '__Host-session' : 'session_token';
+    res.cookie(sessionCookieName(), sessionToken, { ...sessionCookieOptions(), maxAge: 12 * 60 * 60 * 1000 });
 
-    res.cookie(cookieName, sessionToken, {
-      httpOnly: true,
-      secure: isProduction,
-      sameSite: 'lax',
-      path: '/',
-      maxAge: 12 * 60 * 60 * 1000, // 12 hours
+    await safeAudit({
+      restaurantId: account.restaurant_id ? String(account.restaurant_id) : null,
+      actorId: String(account.id),
+      actorKind: account.account_kind,
+      action: 'LOGIN_SUCCEEDED',
+      entityType: 'ADMIN_ACCOUNT',
+      entityId: String(account.id),
+      requestId: req.requestId,
     });
 
     res.json({
@@ -115,6 +205,8 @@ authRouter.post('/login', async (req: Request, res: Response, next: NextFunction
         email: account.email_normalized,
         accountKind: account.account_kind,
         restaurantId: account.restaurant_id ? String(account.restaurant_id) : null,
+        restaurantName,
+        restaurantCurrency,
         csrfToken,
       },
       meta: { requestId: req.requestId },
@@ -132,8 +224,18 @@ authRouter.post('/logout', authenticateSession, async (req: Request, res: Respon
       await SessionManager.revokeSession(sessionToken);
     }
 
-    res.clearCookie('session_token', { path: '/' });
-    res.clearCookie('__Host-session', { path: '/' });
+    const user = req.sessionUser!;
+    await safeAudit({
+      restaurantId: user.restaurantId,
+      actorId: user.adminAccountId,
+      actorKind: user.accountKind,
+      action: 'LOGOUT',
+      entityType: 'ADMIN_ACCOUNT',
+      entityId: user.adminAccountId,
+      requestId: req.requestId,
+    });
+
+    res.clearCookie(sessionCookieName(), sessionCookieOptions());
 
     res.json({
       data: { message: 'Logged out successfully' },
@@ -179,36 +281,38 @@ authRouter.get('/me', authenticateSession, async (req: Request, res: Response, n
   }
 });
 
+
 // POST /api/v1/auth/password-setup
 authRouter.post('/password-setup', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const body = passwordSetupSchema.parse(req.body);
     const tokenHash = hashToken(body.token);
-    const now = new Date();
-
-    const [rows] = await pool.execute<RowDataPacket[]>(
-      `SELECT id, admin_account_id, expires_at, used_at 
-       FROM account_tokens 
-       WHERE token_hash = ? AND purpose = 'PASSWORD_SETUP'`,
-      [tokenHash]
-    );
-
-    const tokenRecord = rows[0];
-    if (!tokenRecord || tokenRecord.used_at || new Date(tokenRecord.expires_at) <= now) {
-      throw new AppError(400, 'INVALID_OR_EXPIRED_TOKEN', 'Password setup link is invalid or has expired');
-    }
-
     const hashedPassword = await hashPassword(body.newPassword);
 
-    await pool.execute(
-      `UPDATE admin_accounts SET password_hash = ?, password_setup_required = 0 WHERE id = ?`,
-      [hashedPassword, tokenRecord.admin_account_id]
-    );
+    await withTransaction(async (conn) => {
+      const account = await consumeAccountToken(conn, tokenHash, 'PASSWORD_SETUP');
+      if (!account) {
+        throw new AppError(400, 'INVALID_OR_EXPIRED_TOKEN', 'Password setup link is invalid or has expired');
+      }
 
-    await pool.execute(
-      `UPDATE account_tokens SET used_at = NOW(3) WHERE id = ?`,
-      [tokenRecord.id]
-    );
+      await conn.execute(
+        `UPDATE admin_accounts SET password_hash = ?, password_setup_required = 0 WHERE id = ?`,
+        [hashedPassword, account.id]
+      );
+      await SessionManager.revokeAllAccountSessions(String(account.id), conn);
+      await recordAuditEvent(
+        {
+          restaurantId: account.restaurant_id ? String(account.restaurant_id) : null,
+          actorId: String(account.id),
+          actorKind: account.account_kind,
+          action: 'PASSWORD_SETUP_COMPLETED',
+          entityType: 'ADMIN_ACCOUNT',
+          entityId: String(account.id),
+          requestId: req.requestId,
+        },
+        conn
+      );
+    });
 
     res.json({
       data: { message: 'Password setup successful. You may now log in.' },
@@ -227,25 +331,34 @@ authRouter.post('/password-reset/request', async (req: Request, res: Response, n
 
     // Neutral response to avoid email enumeration
     const [rows] = await pool.execute<RowDataPacket[]>(
-      `SELECT id FROM admin_accounts WHERE email_normalized = ? AND status = 'ACTIVE'`,
+      `SELECT id, restaurant_id, account_kind FROM admin_accounts WHERE email_normalized = ? AND status = 'ACTIVE'`,
       [emailNorm]
     );
 
-    if (rows[0]) {
-      // In production, an email would be sent. For development/testing, we record a token
-      const resetToken = randomBytes(32).toString('hex');
-      const tokenHash = hashToken(resetToken);
-      const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+    const response: Record<string, unknown> = {
+      message: 'If an active account exists with that email, a password reset link has been dispatched.',
+    };
 
-      await pool.execute(
-        `INSERT INTO account_tokens (admin_account_id, purpose, token_hash, expires_at)
-         VALUES (?, 'PASSWORD_RESET', ?, ?)`,
-        [rows[0].id, tokenHash, expiresAt]
-      );
+    if (rows[0]) {
+      const { token, path } = await issueAccountToken(rows[0].id, 'PASSWORD_RESET', emailNorm);
+      await safeAudit({
+        restaurantId: rows[0].restaurant_id ? String(rows[0].restaurant_id) : null,
+        actorId: String(rows[0].id),
+        actorKind: rows[0].account_kind,
+        action: 'PASSWORD_RESET_REQUESTED',
+        entityType: 'ADMIN_ACCOUNT',
+        entityId: String(rows[0].id),
+        requestId: req.requestId,
+      });
+
+      if (process.env.NODE_ENV !== 'production') {
+        response.resetToken = token;
+        response.resetPath = path;
+      }
     }
 
     res.json({
-      data: { message: 'If an active account exists with that email, a password reset link has been dispatched.' },
+      data: response,
       meta: { requestId: req.requestId },
     });
   } catch (err) {
@@ -258,34 +371,32 @@ authRouter.post('/password-reset/complete', async (req: Request, res: Response, 
   try {
     const body = passwordResetCompleteSchema.parse(req.body);
     const tokenHash = hashToken(body.token);
-    const now = new Date();
-
-    const [rows] = await pool.execute<RowDataPacket[]>(
-      `SELECT id, admin_account_id, expires_at, used_at 
-       FROM account_tokens 
-       WHERE token_hash = ? AND purpose = 'PASSWORD_RESET'`,
-      [tokenHash]
-    );
-
-    const tokenRecord = rows[0];
-    if (!tokenRecord || tokenRecord.used_at || new Date(tokenRecord.expires_at) <= now) {
-      throw new AppError(400, 'INVALID_OR_EXPIRED_TOKEN', 'Reset link is invalid or expired');
-    }
-
     const hashedPassword = await hashPassword(body.newPassword);
 
-    await pool.execute(
-      `UPDATE admin_accounts SET password_hash = ? WHERE id = ?`,
-      [hashedPassword, tokenRecord.admin_account_id]
-    );
+    await withTransaction(async (conn) => {
+      const account = await consumeAccountToken(conn, tokenHash, 'PASSWORD_RESET');
+      if (!account || account.status !== 'ACTIVE') {
+        throw new AppError(400, 'INVALID_OR_EXPIRED_TOKEN', 'Reset link is invalid or expired');
+      }
 
-    await pool.execute(
-      `UPDATE account_tokens SET used_at = NOW(3) WHERE id = ?`,
-      [tokenRecord.id]
-    );
-
-    // Revoke all existing sessions
-    await SessionManager.revokeAllAccountSessions(String(tokenRecord.admin_account_id));
+      await conn.execute(
+        `UPDATE admin_accounts SET password_hash = ?, password_setup_required = 0 WHERE id = ?`,
+        [hashedPassword, account.id]
+      );
+      await SessionManager.revokeAllAccountSessions(String(account.id), conn);
+      await recordAuditEvent(
+        {
+          restaurantId: account.restaurant_id ? String(account.restaurant_id) : null,
+          actorId: String(account.id),
+          actorKind: account.account_kind,
+          action: 'PASSWORD_RESET_COMPLETED',
+          entityType: 'ADMIN_ACCOUNT',
+          entityId: String(account.id),
+          requestId: req.requestId,
+        },
+        conn
+      );
+    });
 
     res.json({
       data: { message: 'Password has been reset successfully. Please log in with your new password.' },

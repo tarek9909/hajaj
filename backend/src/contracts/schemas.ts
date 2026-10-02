@@ -1,4 +1,81 @@
 import { z } from 'zod';
+import { DateTime } from 'luxon';
+
+// ---------- shared validators ----------
+
+const isRealDate = (v: string): boolean => /^\d{4}-\d{2}-\d{2}$/.test(v) && DateTime.fromISO(v, { zone: 'utc' }).isValid;
+
+/** Real calendar date, YYYY-MM-DD. */
+const dateString = z.string().refine(isRealDate, { message: 'Must be a valid date (YYYY-MM-DD)' });
+
+/** Real calendar month start, YYYY-MM-01. */
+const monthStartString = z
+  .string()
+  .refine((v) => /^\d{4}-\d{2}-01$/.test(v) && isRealDate(v), { message: 'Must be the first day of a month (YYYY-MM-01)' });
+
+/** Month, YYYY-MM. */
+export const monthSchema = z
+  .string()
+  .refine((v) => /^\d{4}-(0[1-9]|1[0-2])$/.test(v), { message: 'Month must be in YYYY-MM format' });
+
+/** Month query value: accepts YYYY-MM or YYYY-MM-01 and normalizes to YYYY-MM. */
+export const monthQuerySchema = z
+  .string()
+  .regex(/^\d{4}-\d{2}(-01)?$/, 'Month must be in YYYY-MM format')
+  .transform((v) => v.slice(0, 7))
+  .pipe(monthSchema);
+
+/** ISO-8601 datetime (offset optional). */
+const isoDateTime = z
+  .string()
+  .refine((v) => /^\d{4}-\d{2}-\d{2}T/.test(v) && DateTime.fromISO(v, { setZone: true }).isValid, {
+    message: 'Must be a valid ISO-8601 datetime',
+  });
+
+const localTime = z.string().refine(
+  (v) => {
+    const m = /^(\d{2}):(\d{2})(?::(\d{2}))?$/.exec(v);
+    return !!m && Number(m[1]) <= 23 && Number(m[2]) <= 59 && (m[3] === undefined || Number(m[3]) <= 59);
+  },
+  { message: 'Must be a valid time (HH:MM)' }
+);
+
+const timezoneString = z
+  .string()
+  .trim()
+  .min(1)
+  .max(64)
+  .refine(
+    (v) => {
+      try {
+        new Intl.DateTimeFormat('en-US', { timeZone: v });
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    { message: 'Must be a valid IANA timezone' }
+  );
+
+const currencyCodeString = z
+  .string()
+  .trim()
+  .toUpperCase()
+  .regex(/^[A-Z]{3}$/, 'Must be a 3-letter currency code');
+
+/** Money/quantity value: positive, max 4 decimals, fits DECIMAL(18,4). */
+const decimalValue = z
+  .number()
+  .positive()
+  .max(99999999999999)
+  .refine((v) => Math.abs(Math.round(v * 10000) / 10000 - v) < 1e-9, { message: 'At most 4 decimal places allowed' });
+
+const MAX_MINUTES = 1440;
+
+const toMinuteOfDay = (t: string): number => {
+  const [h, m] = t.split(':');
+  return Number(h) * 60 + Number(m);
+};
 
 export const loginSchema = z.object({
   email: z.string().email(),
@@ -24,10 +101,10 @@ export const createRestaurantSchema = z.object({
   contactName: z.string().trim().max(200).optional().nullable(),
   contactMobile: z.string().trim().max(30).optional().nullable(),
   contactEmail: z.string().email().optional().nullable(),
-  currencyCode: z.string().trim().length(3).toUpperCase(),
+  currencyCode: currencyCodeString,
   currencyDecimalPlaces: z.number().int().min(0).max(4).default(2),
-  timezone: z.string().trim().min(1).max(64),
-  payrollStartMonth: z.string().regex(/^\d{4}-\d{2}-01$/),
+  timezone: timezoneString,
+  payrollStartMonth: monthStartString,
   initialAdmin: z.object({
     fullName: z.string().trim().min(1).max(200),
     email: z.string().email(),
@@ -51,6 +128,8 @@ export const updateRestaurantSchema = z.object({
   contactName: z.string().trim().max(200).optional().nullable(),
   contactMobile: z.string().trim().max(30).optional().nullable(),
   contactEmail: z.string().email().optional().nullable(),
+  currencyCode: currencyCodeString.optional(),
+  timezone: timezoneString.optional(),
   expectedVersion: z.number().int().positive(),
 });
 
@@ -77,32 +156,58 @@ export const updatePositionSchema = z.object({
   expectedVersion: z.number().int().positive(),
 });
 
-export const createDeductionTypeSchema = z.object({
-  name: z.string().trim().min(1).max(120),
-  calculationMethod: z.enum(['FIXED', 'DAILY_PERCENTAGE']),
-  defaultValue: z.number().min(0),
-});
+export const createDeductionTypeSchema = z
+  .object({
+    name: z.string().trim().min(1).max(120),
+    calculationMethod: z.enum(['FIXED', 'DAILY_PERCENTAGE']),
+    defaultValue: z.number().min(0).max(99999999999999),
+  })
+  .superRefine((v, ctx) => {
+    if (v.calculationMethod === 'DAILY_PERCENTAGE' && v.defaultValue > 100) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['defaultValue'], message: 'Percentage cannot exceed 100' });
+    }
+  });
 
-export const updateDeductionTypeSchema = z.object({
-  name: z.string().trim().min(1).max(120).optional(),
-  calculationMethod: z.enum(['FIXED', 'DAILY_PERCENTAGE']).optional(),
-  defaultValue: z.number().min(0).optional(),
-  status: z.enum(['ACTIVE', 'INACTIVE']).optional(),
-  expectedVersion: z.number().int().positive(),
-});
+export const updateDeductionTypeSchema = z
+  .object({
+    name: z.string().trim().min(1).max(120).optional(),
+    calculationMethod: z.enum(['FIXED', 'DAILY_PERCENTAGE']).optional(),
+    defaultValue: z.number().min(0).max(99999999999999).optional(),
+    status: z.enum(['ACTIVE', 'INACTIVE']).optional(),
+    expectedVersion: z.number().int().positive(),
+  })
+  .superRefine((v, ctx) => {
+    if (v.calculationMethod === 'DAILY_PERCENTAGE' && v.defaultValue !== undefined && v.defaultValue > 100) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['defaultValue'], message: 'Percentage cannot exceed 100' });
+    }
+  });
 
 export const createShiftTemplateSchema = z.object({
   name: z.string().trim().min(1).max(120),
   intervals: z
     .array(
-      z.object({
-        sequenceNumber: z.number().int().positive(),
-        startLocalTime: z.string().regex(/^\d{2}:\d{2}(:\d{2})?$/),
-        startDayOffset: z.number().int().min(0).max(1).default(0),
-        endLocalTime: z.string().regex(/^\d{2}:\d{2}(:\d{2})?$/),
-        endDayOffset: z.number().int().min(0).max(1).default(0),
-        plannedUnpaidBreakMinutes: z.number().int().min(0).default(0),
-      })
+      z
+        .object({
+          sequenceNumber: z.number().int().positive(),
+          startLocalTime: localTime,
+          startDayOffset: z.number().int().min(0).max(1).default(0),
+          endLocalTime: localTime,
+          endDayOffset: z.number().int().min(0).max(1).default(0),
+          plannedUnpaidBreakMinutes: z.number().int().min(0).max(MAX_MINUTES).default(0),
+        })
+        .superRefine((v, ctx) => {
+          const start = v.startDayOffset * MAX_MINUTES + toMinuteOfDay(v.startLocalTime);
+          const end = v.endDayOffset * MAX_MINUTES + toMinuteOfDay(v.endLocalTime);
+          if (end <= start) {
+            ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['endLocalTime'], message: 'Interval end must be after start' });
+          } else if (v.plannedUnpaidBreakMinutes >= end - start) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              path: ['plannedUnpaidBreakMinutes'],
+              message: 'Unpaid break must be shorter than the interval',
+            });
+          }
+        })
     )
     .min(1),
 });
@@ -113,8 +218,8 @@ export const createEmployeeSchema = z.object({
   mobile: z.string().trim().min(1).max(30),
   positionId: z.string(),
   monthlySalary: z.number().min(0),
-  employmentStartDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
-  employmentEndDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().nullable(),
+  employmentStartDate: dateString,
+  employmentEndDate: dateString.optional().nullable(),
   reason: z.string().trim().min(1).default('Initial salary'),
 });
 
@@ -122,18 +227,18 @@ export const updateEmployeeSchema = z.object({
   fullName: z.string().trim().min(1).max(200).optional(),
   mobile: z.string().trim().max(30).optional(),
   positionId: z.string().optional(),
-  employmentEndDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().nullable(),
+  employmentEndDate: dateString.optional().nullable(),
   expectedVersion: z.number().int().positive(),
 });
 
 export const createSalaryVersionSchema = z.object({
-  effectiveFromMonth: z.string().regex(/^\d{4}-\d{2}-01$/),
+  effectiveFromMonth: monthStartString,
   monthlySalary: z.number().min(0),
   reason: z.string().trim().min(1).max(500),
 });
 
 export const createPolicyVersionSchema = z.object({
-  effectiveFromMonth: z.string().regex(/^\d{4}-\d{2}-01$/),
+  effectiveFromMonth: monthStartString,
   salaryWorkingDayDivisor: z.number().int().min(1).max(31),
   standardDailyMinutes: z.number().int().min(1).max(1440),
   overtimeMultiplier: z.number().min(1),
@@ -146,8 +251,8 @@ export const createPolicyVersionSchema = z.object({
 
 export const bulkScheduleSchema = z.object({
   employeeIds: z.array(z.string()).min(1),
-  dateFrom: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
-  dateTo: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  dateFrom: dateString,
+  dateTo: dateString,
   weekdays: z.array(z.number().int().min(1).max(7)), // 1=Mon ... 7=Sun
   shiftTemplateId: z.string().optional().nullable(),
   dayType: z.enum(['WORK', 'OFF']).default('WORK'),
@@ -161,9 +266,9 @@ export const updateScheduleDaySchema = z.object({
     .array(
       z.object({
         sequenceNumber: z.number().int().positive(),
-        plannedStartAt: z.string(),
-        plannedEndAt: z.string(),
-        plannedUnpaidBreakMinutes: z.number().int().min(0).default(0),
+        plannedStartAt: isoDateTime,
+        plannedEndAt: isoDateTime,
+        plannedUnpaidBreakMinutes: z.number().int().min(0).max(MAX_MINUTES).default(0),
       })
     )
     .optional(),
@@ -180,15 +285,15 @@ export const updateAttendanceDaySchema = z.object({
     z.object({
       scheduleIntervalId: z.string().optional().nullable(),
       sequenceNumber: z.number().int().positive(),
-      checkInAt: z.string(),
-      checkOutAt: z.string().optional().nullable(),
-      unpaidBreakMinutes: z.number().int().min(0).default(0),
+      checkInAt: isoDateTime,
+      checkOutAt: isoDateTime.optional().nullable(),
+      unpaidBreakMinutes: z.number().int().min(0).max(MAX_MINUTES).default(0),
     })
   ),
 });
 
 export const createCustomWarningSchema = z.object({
-  incidentDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  incidentDate: dateString,
   title: z.string().trim().min(1).max(200),
   reason: z.string().trim().min(1),
   countsTowardLimit: z.boolean().default(true),
@@ -199,16 +304,31 @@ export const voidWarningSchema = z.object({
   expectedVersion: z.number().int().positive(),
 });
 
-export const createSalaryAdjustmentSchema = z.object({
-  payrollMonth: z.string().regex(/^\d{4}-\d{2}-01$/),
-  workDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().nullable(),
-  category: z.enum(['BASE_ADJUSTMENT', 'ADDITION', 'DEDUCTION']),
-  direction: z.enum(['INCREASE', 'DECREASE']),
-  deductionTypeId: z.string().optional().nullable(),
-  calculationMethod: z.enum(['FIXED', 'DAILY_PERCENTAGE']),
-  adjustmentValue: z.number().positive(),
-  reason: z.string().trim().min(1),
-});
+export const createSalaryAdjustmentSchema = z
+  .object({
+    payrollMonth: monthStartString,
+    workDate: dateString.optional().nullable(),
+    category: z.enum(['BASE_ADJUSTMENT', 'ADDITION', 'DEDUCTION']),
+    direction: z.enum(['INCREASE', 'DECREASE']),
+    deductionTypeId: z.string().optional().nullable(),
+    calculationMethod: z.enum(['FIXED', 'DAILY_PERCENTAGE']),
+    adjustmentValue: decimalValue,
+    reason: z.string().trim().min(1),
+  })
+  .superRefine((v, ctx) => {
+    if (v.category === 'ADDITION' && v.direction !== 'INCREASE') {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['direction'], message: 'An ADDITION must be an INCREASE' });
+    }
+    if (v.category === 'DEDUCTION' && v.direction !== 'DECREASE') {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['direction'], message: 'A DEDUCTION must be a DECREASE' });
+    }
+    if (v.deductionTypeId && v.category !== 'DEDUCTION') {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['deductionTypeId'], message: 'A deduction type is only allowed for DEDUCTION' });
+    }
+    if (v.calculationMethod === 'DAILY_PERCENTAGE' && v.adjustmentValue > 100) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['adjustmentValue'], message: 'Percentage cannot exceed 100' });
+    }
+  });
 
 export const voidSalaryAdjustmentSchema = z.object({
   voidReason: z.string().trim().min(1).max(500),
@@ -216,9 +336,15 @@ export const voidSalaryAdjustmentSchema = z.object({
 });
 
 export const createDebtWaiverSchema = z.object({
-  debtSourceId: z.string(),
-  effectiveMonth: z.string().regex(/^\d{4}-\d{2}-01$/),
-  minutes: z.number().int().positive(),
+  employeeId: z.string().optional().nullable(),
+  debtSourceId: z.string().min(1),
+  // Accepts YYYY-MM or YYYY-MM-01; always normalized to YYYY-MM-01.
+  effectiveMonth: z
+    .string()
+    .regex(/^\d{4}-\d{2}(-01)?$/, 'Must be a month (YYYY-MM or YYYY-MM-01)')
+    .transform((v) => `${v.slice(0, 7)}-01`)
+    .pipe(monthStartString),
+  minutes: z.number().int().positive().max(100000),
   reason: z.string().trim().min(1),
 });
 

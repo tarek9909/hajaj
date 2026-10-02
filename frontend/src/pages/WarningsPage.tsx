@@ -1,3 +1,5 @@
+import { usePeriod } from '../context/PeriodContext';
+import { todayIso } from '../lib/format';
 import React, { useState } from 'react';
 import { useParams } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
@@ -11,10 +13,10 @@ import {
 } from 'lucide-react';
 
 export const WarningsPage: React.FC = () => {
-  const { restaurantId = '1' } = useParams<{ restaurantId: string }>();
+  const { restaurantId = '' } = useParams<{ restaurantId: string }>();
   const queryClient = useQueryClient();
 
-  const [selectedMonth, setSelectedMonth] = useState('2026-09');
+  const { month: selectedMonth } = usePeriod();
   const [showCustomModal, setShowCustomModal] = useState(false);
   const [voidingWarning, setVoidingWarning] = useState<any | null>(null);
   const [voidReason, setVoidReason] = useState('');
@@ -23,7 +25,7 @@ export const WarningsPage: React.FC = () => {
   // Custom Warning Form
   const [customForm, setCustomForm] = useState({
     employeeId: '',
-    incidentDate: '2026-09-05',
+    incidentDate: todayIso(),
     title: '',
     reason: '',
     countsTowardLimit: true,
@@ -47,7 +49,7 @@ export const WarningsPage: React.FC = () => {
       setShowCustomModal(false);
       setCustomForm({
         employeeId: '',
-        incidentDate: '2026-09-05',
+        incidentDate: todayIso(),
         title: '',
         reason: '',
         countsTowardLimit: true,
@@ -83,24 +85,17 @@ export const WarningsPage: React.FC = () => {
 
   return (
     <div>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '1.75rem', flexWrap: 'wrap', gap: '1rem' }}>
+      <div className="page-header">
         <div>
-          <h1 style={{ fontSize: '1.75rem', fontWeight: 700, letterSpacing: '-0.02em' }}>
-            Warnings & Conduct Disciplinary Ledger
+          <h1 className="page-title">
+            Warnings
           </h1>
-          <p style={{ color: 'var(--text-muted)', fontSize: '0.875rem', marginTop: '0.25rem' }}>
+          <p className="page-subtitle">
             Automated lateness penalties, custom administrative warnings, and monthly threshold limits.
           </p>
         </div>
 
         <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center' }}>
-          <input
-            type="month"
-            className="input mono"
-            value={selectedMonth}
-            onChange={(e) => setSelectedMonth(e.target.value)}
-            style={{ width: 'auto', padding: '0.4rem 0.75rem' }}
-          />
           <button className="btn btn-primary" onClick={() => { setModalError(null); setShowCustomModal(true); }}>
             <Plus size={16} />
             <span>Issue Custom Warning</span>
@@ -116,13 +111,13 @@ export const WarningsPage: React.FC = () => {
             flexDirection: 'column',
             gap: '0.5rem',
             padding: '1rem 1.25rem',
-            backgroundColor: '#fef2f2',
-            border: '1px solid #fecaca',
+            backgroundColor: 'var(--status-danger-bg)',
+            border: '1px solid var(--status-danger-border)',
             borderRadius: 'var(--radius-lg)',
             marginBottom: '1.75rem',
           }}
         >
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontWeight: 700, color: '#991b1b', fontSize: '0.9rem' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontWeight: 700, color: 'var(--status-danger-text)', fontSize: '0.9rem' }}>
             <ShieldAlert size={20} />
             <span>Warning Threshold Exceeded Alert (Monthly Limit: {threshold})</span>
           </div>
@@ -198,7 +193,7 @@ export const WarningsPage: React.FC = () => {
                       <td style={{ fontSize: '0.8125rem', color: 'var(--text-main)', maxWidth: '280px' }}>
                         <div>{w.reason}</div>
                         {w.adminVoided && (
-                          <div style={{ fontSize: '0.75rem', color: '#dc2626', marginTop: 4 }}>
+                          <div style={{ fontSize: '0.75rem', color: 'var(--status-danger)', marginTop: 4 }}>
                             Void reason: {w.voidReason}
                           </div>
                         )}
@@ -223,7 +218,7 @@ export const WarningsPage: React.FC = () => {
                         {!w.adminVoided && (
                           <button
                             className="btn btn-secondary btn-sm"
-                            style={{ color: '#dc2626' }}
+                            style={{ color: 'var(--status-danger)' }}
                             onClick={() => {
                               setModalError(null);
                               setVoidReason('');
@@ -262,7 +257,7 @@ export const WarningsPage: React.FC = () => {
                   backgroundColor: 'var(--status-danger-bg)',
                   border: '1px solid var(--status-danger-border)',
                   borderRadius: 'var(--radius-md)',
-                  color: '#991b1b',
+                  color: 'var(--status-danger-text)',
                   fontSize: '0.8125rem',
                   marginBottom: '1rem',
                 }}
@@ -377,7 +372,7 @@ export const WarningsPage: React.FC = () => {
                   backgroundColor: 'var(--status-danger-bg)',
                   border: '1px solid var(--status-danger-border)',
                   borderRadius: 'var(--radius-md)',
-                  color: '#991b1b',
+                  color: 'var(--status-danger-text)',
                   fontSize: '0.8125rem',
                   marginBottom: '1rem',
                 }}
