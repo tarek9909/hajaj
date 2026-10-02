@@ -1,0 +1,37 @@
+{
+  "name": "restaurant-workforce-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx watch src/server.ts",
+    "worker": "tsx watch src/worker.ts",
+    "start": "node dist/server.js",
+    "test": "vitest run",
+    "migrate": "tsx src/scripts/migrate.ts",
+    "seed": "tsx src/scripts/seed.ts",
+    "bootstrap:superadmin": "tsx src/scripts/bootstrapSuperadmin.ts"
+  },
+  "dependencies": {
+    "@node-rs/argon2": "^2.0.2",
+    "cookie-parser": "^1.4.6",
+    "cors": "^2.8.5",
+    "decimal.js": "^10.4.3",
+    "dotenv": "^16.4.5",
+    "exceljs": "^4.4.0",
+    "express": "^5.0.0",
+    "luxon": "^3.5.0",
+    "mysql2": "^3.11.3",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/cookie-parser": "^1.4.7",
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.0",
+    "@types/luxon": "^3.4.2",
+    "@types/node": "^24.0.0",
+    "tsx": "^4.19.1",
+    "typescript": "^5.6.2",
+    "vitest": "^2.1.1"
+  }
+}
