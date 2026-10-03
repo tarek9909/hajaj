@@ -501,6 +501,14 @@ deductionTypesRouter.post('/', async (req: Request, res: Response, next: NextFun
     const restaurantId = req.tenantContext!.restaurantId;
     const actorId = req.tenantContext!.actorId;
     const body = createDeductionTypeSchema.parse(req.body);
+    const RESERVED_LATE_NAMES = /^(late|lateness|late\s*penalty|late\s*deduction|late\s*arrival)$/i;
+    if (RESERVED_LATE_NAMES.test(body.name.trim())) {
+      throw new AppError(
+        422,
+        'RESERVED_DEDUCTION_NAME',
+        'Lateness deductions are automatically calculated by the attendance engine under Operational Policy (late_grace_minutes and late_deduction_percentage). Manual deduction types are strictly for other operational deductions (e.g. register shortages, equipment breakage, uniform fees) to prevent duplicate penalties.'
+      );
+    }
     if (body.calculationMethod === 'DAILY_PERCENTAGE' && body.defaultValue > 100) {
       throw new AppError(422, 'INVALID_VALUE', 'A percentage deduction cannot exceed 100');
     }
@@ -549,6 +557,16 @@ deductionTypesRouter.patch('/:deductionTypeId', async (req: Request, res: Respon
       [restaurantId, deductionTypeId]
     );
     if (!current[0]) throw new AppError(404, 'NOT_FOUND', 'Deduction type not found');
+
+    const RESERVED_LATE_NAMES = /^(late|lateness|late\s*penalty|late\s*deduction|late\s*arrival)$/i;
+    if (body.name && RESERVED_LATE_NAMES.test(body.name.trim())) {
+      throw new AppError(
+        422,
+        'RESERVED_DEDUCTION_NAME',
+        'Lateness deductions are automatically calculated by the attendance engine under Operational Policy. Manual deduction types cannot be named "Late" or "Late Penalty" to prevent duplicate penalties.'
+      );
+    }
+
     const method = body.calculationMethod ?? current[0].calculation_method;
     const value = body.defaultValue ?? Number(current[0].default_value);
     if (method === 'DAILY_PERCENTAGE' && value > 100) {

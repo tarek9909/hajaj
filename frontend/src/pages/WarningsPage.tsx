@@ -10,6 +10,7 @@ import {
   AlertCircle,
   Clock,
   ShieldAlert,
+  Download,
 } from 'lucide-react';
 
 export const WarningsPage: React.FC = () => {
@@ -96,6 +97,16 @@ export const WarningsPage: React.FC = () => {
         </div>
 
         <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center' }}>
+          <a
+            href={warningsApi.getExportUrl(restaurantId, selectedMonth)}
+            className="btn btn-secondary"
+            download
+            style={{ textDecoration: 'none' }}
+            title="Download complete warnings report Excel spreadsheet"
+          >
+            <Download size={15} />
+            <span>Export Report (.xlsx)</span>
+          </a>
           <button className="btn btn-primary" onClick={() => { setModalError(null); setShowCustomModal(true); }}>
             <Plus size={16} />
             <span>Issue Custom Warning</span>

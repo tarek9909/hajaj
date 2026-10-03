@@ -6,7 +6,6 @@ import {
   Users,
   CalendarDays,
   Clock,
-  AlertTriangle,
   Scale,
   SlidersHorizontal,
   FileSpreadsheet,
@@ -35,7 +34,7 @@ interface NavGroup {
   items: NavItem[];
 }
 
-const PERIOD_SCREENS = ['dashboard', 'scheduling', 'warnings', 'debt', 'adjustments', 'payroll'];
+const PERIOD_SCREENS = ['dashboard', 'scheduling', 'debt', 'adjustments', 'payroll'];
 
 export const AppLayout: React.FC = () => {
   const { user, logout, setActiveRestaurantId } = useAuth();
@@ -93,7 +92,6 @@ export const AppLayout: React.FC = () => {
           label: 'People',
           items: [
             { label: 'Employees', path: `${base}/employees`, icon: Users },
-            { label: 'Warnings', path: `${base}/warnings`, icon: AlertTriangle },
           ],
         },
         {

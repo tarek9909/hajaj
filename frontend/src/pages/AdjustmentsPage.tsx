@@ -122,7 +122,7 @@ export const AdjustmentsPage: React.FC = () => {
             Adjustments
           </h1>
           <p className="page-subtitle">
-            Discrete ledger adjustments: discretionary bonuses, custom deductions, and base revisions.
+            Discrete ledger adjustments: discretionary bonuses, operational deductions (till shortages, breakage), and base revisions. Automatic lateness penalties are tracked separately via attendance.
           </p>
         </div>
 
@@ -267,10 +267,36 @@ export const AdjustmentsPage: React.FC = () => {
               onSubmit={(e) => {
                 e.preventDefault();
                 setModalError(null);
+                if (formState.category === 'DEDUCTION' && /^(late|lateness|late\s*penalty|late\s*deduction|late\s*arrival)$/i.test(formState.reason.trim())) {
+                  setModalError('Lateness penalties are automatically calculated by the attendance engine under Operational Policy. Please do not record manual lateness deductions to avoid duplicate penalties.');
+                  return;
+                }
                 createMutation.mutate(formState);
               }}
             >
               <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+                {formState.category === 'DEDUCTION' && (
+                  <div
+                    style={{
+                      display: 'flex',
+                      alignItems: 'flex-start',
+                      gap: '0.5rem',
+                      padding: '0.65rem 0.85rem',
+                      backgroundColor: 'var(--surface-muted)',
+                      border: '1px solid var(--border)',
+                      borderRadius: 'var(--radius-md)',
+                      color: 'var(--text-muted)',
+                      fontSize: '0.8rem',
+                      lineHeight: 1.4,
+                    }}
+                  >
+                    <AlertCircle size={15} style={{ color: 'var(--primary)', flexShrink: 0, marginTop: '0.1rem' }} />
+                    <span>
+                      <strong>Operational Deductions Only:</strong> Automatic lateness penalties are calculated directly from daily attendance records according to your Operational Policy. Use this form only for operational items like cash register shortages, equipment damage, or uniform fees.
+                    </span>
+                  </div>
+                )}
+
                 <div className="form-group">
                   <label className="form-label">Employee</label>
                   <select
@@ -318,16 +344,26 @@ export const AdjustmentsPage: React.FC = () => {
 
                   {formState.category === 'DEDUCTION' && (
                     <div className="form-group">
-                      <label className="form-label">Deduction Type</label>
+                      <label className="form-label">Deduction Type Preset</label>
                       <select
                         className="select"
                         value={formState.deductionTypeId}
-                        onChange={(e) => setFormState({ ...formState, deductionTypeId: e.target.value })}
+                        onChange={(e) => {
+                          const selectedId = e.target.value;
+                          const dt = deductionTypes.find((d) => d.id === selectedId);
+                          setFormState({
+                            ...formState,
+                            deductionTypeId: selectedId,
+                            calculationMethod: dt ? (dt.calculationMethod as any) : formState.calculationMethod,
+                            adjustmentValue: dt ? String(dt.defaultValue) : formState.adjustmentValue,
+                            reason: (!formState.reason && dt) ? dt.name : formState.reason,
+                          });
+                        }}
                       >
-                        <option value="">Select type (optional)...</option>
+                        <option value="">Custom / Select preset...</option>
                         {deductionTypes.map((dt) => (
                           <option key={dt.id} value={dt.id}>
-                            {dt.name}
+                            {dt.name} ({dt.calculationMethod === 'FIXED' ? `${currency} ${dt.defaultValue}` : `${dt.defaultValue}%`})
                           </option>
                         ))}
                       </select>
@@ -372,10 +408,15 @@ export const AdjustmentsPage: React.FC = () => {
                     className="textarea"
                     rows={3}
                     required
-                    placeholder="e.g. Uniform Deposit, Broken Glassware Charge, Spot Bonus..."
+                    placeholder="e.g. Till Shortfall, Broken Kitchenware, Replacement Uniform..."
                     value={formState.reason}
                     onChange={(e) => setFormState({ ...formState, reason: e.target.value })}
                   />
+                  {formState.category === 'DEDUCTION' && /^(late|lateness|late\s*penalty|late\s*deduction|late\s*arrival)$/i.test(formState.reason.trim()) && (
+                    <div style={{ marginTop: '0.4rem', fontSize: '0.8rem', color: 'var(--status-danger)' }}>
+                      Lateness penalties are automatically calculated from attendance. Please do not record manual lateness deductions.
+                    </div>
+                  )}
                 </div>
               </div>
 
@@ -383,7 +424,11 @@ export const AdjustmentsPage: React.FC = () => {
                 <button type="button" className="btn btn-secondary" onClick={() => setShowAddModal(false)}>
                   Cancel
                 </button>
-                <button type="submit" className="btn btn-primary" disabled={createMutation.isPending}>
+                <button
+                  type="submit"
+                  className="btn btn-primary"
+                  disabled={createMutation.isPending || (formState.category === 'DEDUCTION' && /^(late|lateness|late\s*penalty|late\s*deduction|late\s*arrival)$/i.test(formState.reason.trim()))}
+                >
                   {createMutation.isPending ? 'Saving...' : 'Add Adjustment'}
                 </button>
               </div>

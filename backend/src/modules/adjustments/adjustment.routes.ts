@@ -108,6 +108,15 @@ const handleCreateAdjustment = async (req: Request, res: Response, next: NextFun
 
     const body = createSalaryAdjustmentSchema.parse(rawBody);
 
+    const RESERVED_LATE_NAMES = /^(late|lateness|late\s*penalty|late\s*deduction|late\s*arrival)$/i;
+    if (body.category === 'DEDUCTION' && RESERVED_LATE_NAMES.test(body.reason.trim())) {
+      throw new AppError(
+        422,
+        'AUTOMATED_LATE_DEDUCTION',
+        'Lateness penalties are automatically evaluated by the attendance engine under the restaurant\'s Operational Policy. Do not record manual lateness deductions to avoid duplicate penalties.'
+      );
+    }
+
     let newAdjustmentId: number = 0;
     await withTransaction(async (conn) => {
       // Check employee

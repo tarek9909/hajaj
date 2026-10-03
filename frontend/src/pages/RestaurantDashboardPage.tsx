@@ -83,7 +83,7 @@ export const RestaurantDashboardPage: React.FC = () => {
   if (limitReached > 0) {
     attention.push({
       tone: 'danger', icon: AlertTriangle, title: `${limitReached} employee${limitReached === 1 ? ' has' : 's have'} reached the warning limit`,
-      detail: `Threshold is ${warnings.data?.threshold ?? 3} counted warnings in a month.`, to: `${base}/warnings`, cta: 'Review warnings',
+      detail: `Threshold is ${warnings.data?.threshold ?? 3} counted warnings in a month.`, to: `${base}/payroll`, cta: 'Review in reports',
     });
   }
   if ((summary?.totalRemainingDebtMinutes ?? 0) > 0) {

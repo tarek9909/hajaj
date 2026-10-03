@@ -2,7 +2,7 @@ import { Router, type Request, type Response, type NextFunction } from 'express'
 import type { Pool, PoolConnection, RowDataPacket, ResultSetHeader } from 'mysql2/promise';
 import { DateTime } from 'luxon';
 import { withTransaction, pool } from '../../infrastructure/database/pool.js';
-import { bulkScheduleSchema, updateScheduleDaySchema } from '../../contracts/schemas.js';
+import { bulkScheduleSchema, batchScheduleSchema, updateScheduleDaySchema } from '../../contracts/schemas.js';
 import { AppError } from '../../middleware/errorHandler.js';
 import { recordAuditEvent } from '../../infrastructure/logging/audit.js';
 import { assertRangeNotFinalized, bumpSourceRevision, normalizeMonthStart } from '../configuration/periodGuards.js';
@@ -587,6 +587,173 @@ schedulingRouter.post('/bulk-commit', async (req: Request, res: Response, next: 
         count: scheduled,
         message: scheduled === 0 ? 'No dates matched the selected pattern.' : 'Bulk schedule applied successfully',
       },
+      meta: { requestId: req.requestId },
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/v1/restaurants/:restaurantId/schedules/batch
+schedulingRouter.post('/batch', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const restaurantId = req.tenantContext!.restaurantId;
+    const actorId = req.tenantContext!.actorId;
+    const body = batchScheduleSchema.parse(req.body);
+
+    const timezone = await getTimezone(pool, restaurantId);
+
+    // Group dates to check period finalization
+    const affectedMonths = new Set<string>();
+    for (const a of body.assignments) {
+      affectedMonths.add(normalizeMonthStart(a.workDate));
+    }
+
+    const scheduledCount = await withTransaction(async (conn) => {
+      // 1. Lock and verify all affected months
+      for (const mStart of affectedMonths) {
+        await conn.execute(
+          `INSERT IGNORE INTO payroll_periods (restaurant_id, month_start, status, source_revision)
+           VALUES (?, ?, 'DRAFT', 1)`,
+          [restaurantId, mStart]
+        );
+        const [periodRows] = await conn.execute<RowDataPacket[]>(
+          `SELECT status FROM payroll_periods WHERE restaurant_id = ? AND month_start = ? FOR UPDATE`,
+          [restaurantId, mStart]
+        );
+        if (periodRows[0]?.status === 'FINALIZED') {
+          throw new AppError(409, 'PAYROLL_PERIOD_FINALIZED', `Cannot modify schedule in finalized month ${mStart.slice(0, 7)}`);
+        }
+      }
+
+      // 2. Pre-cache shift templates
+      const templateIds = [
+        ...new Set(body.assignments.filter((a) => a.dayType === 'WORK' && a.shiftTemplateId).map((a) => String(a.shiftTemplateId))),
+      ];
+      const templateMap = new Map<string, { name: string; intervals: TemplateIntervalRow[] }>();
+      for (const tId of templateIds) {
+        templateMap.set(tId, await loadTemplate(conn, restaurantId, tId, false));
+      }
+
+      // Pre-cache policy per month
+      const policyMap = new Map<string, string>();
+      for (const mStart of affectedMonths) {
+        policyMap.set(mStart, await getPolicyVersionId(conn, restaurantId, mStart));
+      }
+
+      let count = 0;
+      for (const item of body.assignments) {
+        const mStart = normalizeMonthStart(item.workDate);
+
+        // Check if existing day has attendance
+        const [existingRows] = await conn.execute<RowDataPacket[]>(
+          `SELECT d.id,
+                  (SELECT COUNT(*) FROM attendance_days a WHERE a.restaurant_id = d.restaurant_id AND a.schedule_day_id = d.id) AS attendance_count
+           FROM schedule_days d
+           WHERE d.restaurant_id = ? AND d.employee_id = ? AND d.work_date = ?`,
+          [restaurantId, item.employeeId, item.workDate]
+        );
+        const existing = existingRows[0];
+        if (existing && Number(existing.attendance_count) > 0) {
+          throw new AppError(
+            409,
+            'SCHEDULE_DAY_HAS_ATTENDANCE',
+            `Date ${item.workDate} already has attendance recorded and cannot be modified`
+          );
+        }
+
+        if (item.dayType === 'CLEAR') {
+          if (existing) {
+            await conn.execute(`DELETE FROM schedule_intervals WHERE restaurant_id = ? AND schedule_day_id = ?`, [
+              restaurantId,
+              existing.id,
+            ]);
+            await conn.execute(`DELETE FROM schedule_days WHERE restaurant_id = ? AND id = ?`, [
+              restaurantId,
+              existing.id,
+            ]);
+            count++;
+          }
+          continue;
+        }
+
+        const isWork = item.dayType === 'WORK';
+        const tmpl = isWork && item.shiftTemplateId ? templateMap.get(String(item.shiftTemplateId)) : null;
+        let intervals: PlannedInterval[] = [];
+        let requiredMinutes = 0;
+        if (isWork) {
+          if (!tmpl) {
+            throw new AppError(422, 'INVALID_INTERVAL', `A WORK day needs a valid shift template (missing for ${item.workDate})`);
+          }
+          const v = validatePlannedIntervals(buildTemplateIntervals(item.workDate, timezone, tmpl.intervals));
+          intervals = v.sorted;
+          requiredMinutes = v.requiredMinutes;
+        }
+
+        const [dayRes] = await conn.execute<ResultSetHeader>(
+          `INSERT INTO schedule_days
+            (restaurant_id, employee_id, work_date, payroll_month, day_type, source_template_id, policy_version_id, required_minutes, timezone_snapshot, created_by, updated_by)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON DUPLICATE KEY UPDATE
+             id = LAST_INSERT_ID(id),
+             day_type = VALUES(day_type),
+             source_template_id = VALUES(source_template_id),
+             policy_version_id = VALUES(policy_version_id),
+             required_minutes = VALUES(required_minutes),
+             timezone_snapshot = VALUES(timezone_snapshot),
+             exception_reason = NULL,
+             row_version = row_version + 1,
+             updated_by = VALUES(updated_by)`,
+          [
+            restaurantId,
+            item.employeeId,
+            item.workDate,
+            mStart,
+            item.dayType,
+            isWork ? item.shiftTemplateId || null : null,
+            policyMap.get(mStart)!,
+            requiredMinutes,
+            timezone,
+            actorId,
+            actorId,
+          ]
+        );
+        const scheduleDayId = String(dayRes.insertId);
+
+        await conn.execute(`DELETE FROM schedule_intervals WHERE restaurant_id = ? AND schedule_day_id = ?`, [
+          restaurantId,
+          scheduleDayId,
+        ]);
+        if (intervals.length > 0) {
+          await insertIntervals(conn, restaurantId, item.employeeId, scheduleDayId, intervals);
+        }
+        count++;
+      }
+
+      // Invalidate all affected months
+      for (const mStart of affectedMonths) {
+        await bumpSourceRevision(conn, restaurantId, mStart, mStart);
+      }
+
+      await recordAuditEvent(
+        {
+          restaurantId,
+          actorId,
+          actorKind: req.tenantContext!.accountKind,
+          action: 'BATCH_SCHEDULE_COMMIT',
+          entityType: 'SCHEDULE_DAY',
+          entityId: `${body.assignments.length} assignments`,
+          requestId: req.requestId,
+          afterValues: { count, months: [...affectedMonths] },
+        },
+        conn
+      );
+
+      return count;
+    });
+
+    res.json({
+      data: { scheduledCount, message: `Successfully updated ${scheduledCount} schedule day(s)` },
       meta: { requestId: req.requestId },
     });
   } catch (err) {

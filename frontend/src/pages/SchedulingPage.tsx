@@ -1,33 +1,41 @@
-import { usePeriod } from '../context/PeriodContext';
-import { currentMonth, monthStart, monthEnd } from '../lib/format';
 import React, { useState } from 'react';
 import { useParams } from 'react-router-dom';
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { schedulingApi, configApi, employeesApi } from '../lib/api';
+import { usePeriod } from '../context/PeriodContext';
 import {
-  Sparkles,
-  AlertCircle,
+  Calendar,
+  CalendarDays,
+  Users,
+  ChevronLeft,
+  ChevronRight,
+  CheckCircle2,
 } from 'lucide-react';
+import { currentMonth, monthLabel, shiftMonth, weekStart, todayIso } from '../lib/format';
+import { MonthlyShiftCalendar } from '../components/MonthlyShiftCalendar';
+import { WeeklyShiftSchedule } from '../components/WeeklyShiftSchedule';
 
 export const SchedulingPage: React.FC = () => {
   const { restaurantId = '' } = useParams<{ restaurantId: string }>();
   const queryClient = useQueryClient();
 
-  const { month: selectedMonth } = usePeriod();
-  const [showBulkModal, setShowBulkModal] = useState(false);
-  const [previewResult, setPreviewResult] = useState<any | null>(null);
-  const [modalError, setModalError] = useState<string | null>(null);
+  const { month: selectedMonth, setMonth } = usePeriod();
+  const [viewMode, setViewMode] = useState<'WEEKLY' | 'CALENDAR' | 'MATRIX'>('WEEKLY');
+  const [activeWeekStart, setActiveWeekStart] = useState<string>(() => weekStart(todayIso()));
+  const [cellFeedback, setCellFeedback] = useState<string | null>(null);
 
-  // Bulk Generator State
-  const [bulkForm, setBulkForm] = useState({
-    employeeIds: [] as string[],
-    startDate: monthStart(currentMonth()),
-    endDate: monthEnd(currentMonth()),
-    shiftTemplateId: '',
-    dayType: 'WORK' as 'WORK' | 'OFF',
-    weekdays: [1, 2, 3, 4, 5, 6, 7] as number[],
-    overwriteExisting: true,
-  });
+  const handleWeekChange = (newWeekStart: string) => {
+    setActiveWeekStart(newWeekStart);
+    const weekMonth = newWeekStart.slice(0, 7);
+    if (weekMonth !== selectedMonth) {
+      setMonth(weekMonth);
+    }
+  };
+
+  const handleMonthChange = (newMonth: string) => {
+    setMonth(newMonth);
+    setActiveWeekStart(weekStart(`${newMonth}-01`));
+  };
 
   const { data: employees = [] } = useQuery({
     queryKey: ['employees', restaurantId],
@@ -44,29 +52,7 @@ export const SchedulingPage: React.FC = () => {
     queryFn: () => schedulingApi.getCalendar(restaurantId, selectedMonth),
   });
 
-  const previewMutation = useMutation({
-    mutationFn: (data: typeof bulkForm) => schedulingApi.previewBulk(restaurantId, data),
-    onSuccess: (res) => {
-      setPreviewResult(res);
-    },
-    onError: (err: any) => {
-      setModalError(err.message || 'Failed to preview schedule generation');
-    },
-  });
-
-  const commitMutation = useMutation({
-    mutationFn: (data: typeof bulkForm) => schedulingApi.commitBulk(restaurantId, data),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['schedules', restaurantId, selectedMonth] });
-      setShowBulkModal(false);
-      setPreviewResult(null);
-    },
-    onError: (err: any) => {
-      setModalError(err.message || 'Failed to commit schedules');
-    },
-  });
-
-  // Calculate days in month
+  // Calculate days in month for Matrix view
   const [yearStr, monthStr] = selectedMonth.split('-');
   const daysInMonth = new Date(Number(yearStr), Number(monthStr), 0).getDate();
   const dayNumbers = Array.from({ length: daysInMonth }, (_, i) => i + 1);
@@ -77,11 +63,19 @@ export const SchedulingPage: React.FC = () => {
     scheduleMap.set(`${s.employeeId}_${s.workDate}`, s);
   });
 
-  const handleSelectAllEmployees = () => {
-    if (bulkForm.employeeIds.length === employees.length) {
-      setBulkForm({ ...bulkForm, employeeIds: [] });
-    } else {
-      setBulkForm({ ...bulkForm, employeeIds: employees.map((e) => e.id) });
+  const handleQuickCellChange = async (employeeId: string, workDate: string, value: string) => {
+    try {
+      const dayType = value === 'OFF' ? 'OFF' : value === '' ? 'CLEAR' : 'WORK';
+      const shiftTemplateId = dayType === 'WORK' ? value : null;
+      await schedulingApi.batchSchedule(restaurantId, {
+        assignments: [{ employeeId, workDate, dayType, shiftTemplateId }],
+      });
+      queryClient.invalidateQueries({ queryKey: ['schedules', restaurantId] });
+      queryClient.invalidateQueries({ queryKey: ['schedules-range', restaurantId] });
+      setCellFeedback(`Shift updated for ${workDate}`);
+      setTimeout(() => setCellFeedback(null), 2500);
+    } catch (err: any) {
+      alert(err.message || 'Failed to update schedule');
     }
   };
 
@@ -93,383 +87,347 @@ export const SchedulingPage: React.FC = () => {
             Schedule
           </h1>
           <p className="page-subtitle">
-            Monthly calendar grid of planned shifts, interval requirements, and multi-staff bulk assignment.
+            Single source of truth scheduling: interactive Weekly schedule, Monthly calendar, and Staff Matrix grid synced in real-time.
           </p>
         </div>
 
-        <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center' }}>
-
-          <button className="btn btn-primary" onClick={() => { setModalError(null); setPreviewResult(null); setShowBulkModal(true); }}>
-            <Sparkles size={16} />
-            <span>Bulk Shift Generator</span>
-          </button>
+        <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center', flexWrap: 'wrap' }}>
+          <div className="segmented">
+            <button
+              type="button"
+              className={viewMode === 'WEEKLY' ? 'active' : ''}
+              onClick={() => setViewMode('WEEKLY')}
+              style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}
+            >
+              <CalendarDays size={15} />
+              <span>Weekly Schedule</span>
+            </button>
+            <button
+              type="button"
+              className={viewMode === 'CALENDAR' ? 'active' : ''}
+              onClick={() => setViewMode('CALENDAR')}
+              style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}
+            >
+              <Calendar size={15} />
+              <span>Monthly Calendar</span>
+            </button>
+            <button
+              type="button"
+              className={viewMode === 'MATRIX' ? 'active' : ''}
+              onClick={() => setViewMode('MATRIX')}
+              style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}
+            >
+              <Users size={15} />
+              <span>Staff Matrix Grid</span>
+            </button>
+          </div>
         </div>
       </div>
 
-      {/* Grid Legend */}
-      <div className="card" style={{ padding: '0.75rem 1.25rem', marginBottom: '1rem', display: 'flex', alignItems: 'center', gap: '1.5rem', flexWrap: 'wrap' }}>
-        <div style={{ fontSize: '0.8125rem', fontWeight: 600, color: 'var(--text-muted)' }}>Shift Legend:</div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.75rem' }}>
-          <span style={{ width: 12, height: 12, borderRadius: 3, backgroundColor: 'var(--primary)' }} />
-          <span>Morning (08:00 - 16:30, 480m)</span>
-        </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.75rem' }}>
-          <span style={{ width: 12, height: 12, borderRadius: 3, backgroundColor: 'var(--accent)' }} />
-          <span>Evening (16:00 - 00:30, 480m)</span>
-        </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.75rem' }}>
-          <span style={{ width: 12, height: 12, borderRadius: 3, backgroundColor: 'var(--status-warning)' }} />
-          <span>Split Lunch/Dinner (480m)</span>
-        </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.75rem' }}>
-          <span style={{ width: 12, height: 12, borderRadius: 3, backgroundColor: 'var(--border-light)', border: '1px solid var(--border-strong)' }} />
-          <span>Day Off (0m)</span>
-        </div>
-      </div>
+      {viewMode === 'WEEKLY' ? (
+        <WeeklyShiftSchedule
+          restaurantId={restaurantId}
+          employees={employees}
+          templates={templates}
+          selectedWeekStart={activeWeekStart}
+          onWeekChange={handleWeekChange}
+        />
+      ) : viewMode === 'CALENDAR' ? (
+        <MonthlyShiftCalendar
+          restaurantId={restaurantId}
+          selectedMonth={selectedMonth}
+          onMonthChange={handleMonthChange}
+          employees={employees}
+          templates={templates}
+          schedules={schedules}
+        />
+      ) : (
+        <>
+          {/* Matrix Month Navigation & Controls Card */}
+          <div
+            className="card"
+            style={{
+              padding: '0.85rem 1.25rem',
+              marginBottom: '1rem',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              flexWrap: 'wrap',
+              gap: '1rem',
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+              <button
+                type="button"
+                className="btn btn-secondary btn-sm btn-icon"
+                title="Previous Month"
+                onClick={() => handleMonthChange(shiftMonth(selectedMonth, -1))}
+              >
+                <ChevronLeft size={16} />
+              </button>
 
-      {/* Matrix Table */}
-      <div className="card" style={{ padding: 0 }}>
-        <div className="table-container" style={{ border: 'none', maxHeight: '70vh' }}>
-          <table className="table" style={{ fontSize: '0.75rem' }}>
-            <thead style={{ position: 'sticky', top: 0, zIndex: 10 }}>
-              <tr>
-                <th style={{ minWidth: 160, position: 'sticky', left: 0, zIndex: 20, backgroundColor: 'var(--bg-surface-subtle)' }}>
-                  Employee
-                </th>
-                {dayNumbers.map((d) => {
-                  const dStr = d < 10 ? `0${d}` : `${d}`;
-                  const dateObj = new Date(`${selectedMonth}-${dStr}T00:00:00Z`);
-                  const dayName = dateObj.toLocaleDateString('en-US', { weekday: 'narrow', timeZone: 'UTC' });
-                  const isWeekend = dateObj.getUTCDay() === 0;
-
-                  return (
-                    <th
-                      key={d}
-                      style={{
-                        textAlign: 'center',
-                        minWidth: 40,
-                        padding: '0.4rem 0.2rem',
-                        backgroundColor: isWeekend ? 'var(--status-danger-bg)' : undefined,
-                        color: isWeekend ? 'var(--status-danger-text)' : undefined,
-                      }}
-                    >
-                      <div>{dayName}</div>
-                      <div style={{ fontWeight: 700 }}>{d}</div>
-                    </th>
-                  );
-                })}
-              </tr>
-            </thead>
-            <tbody>
-              {isLoading ? (
-                <tr>
-                  <td colSpan={daysInMonth + 1} style={{ textAlign: 'center', padding: '2rem' }}>
-                    Loading schedules...
-                  </td>
-                </tr>
-              ) : employees.length === 0 ? (
-                <tr>
-                  <td colSpan={daysInMonth + 1} style={{ textAlign: 'center', padding: '2rem' }}>
-                    No active employees configured.
-                  </td>
-                </tr>
-              ) : (
-                employees.map((emp) => (
-                  <tr key={emp.id}>
-                    <td
-                      style={{
-                        position: 'sticky',
-                        left: 0,
-                        backgroundColor: '#fff',
-                        zIndex: 5,
-                        fontWeight: 600,
-                        borderRight: '1px solid var(--border-light)',
-                      }}
-                    >
-                      <div>{emp.fullName}</div>
-                      <div className="mono" style={{ fontSize: '0.68rem', color: 'var(--text-muted)' }}>
-                        {emp.employeeNumber}
-                      </div>
-                    </td>
-
-                    {dayNumbers.map((d) => {
-                      const dStr = d < 10 ? `0${d}` : `${d}`;
-                      const workDate = `${selectedMonth}-${dStr}`;
-                      const cell = scheduleMap.get(`${emp.id}_${workDate}`);
-
-                      let bg = 'var(--bg-surface-subtle)';
-                      let label = '-';
-                      let color = 'var(--text-subtle)';
-
-                      if (cell) {
-                        if (cell.dayType === 'OFF') {
-                          bg = 'var(--border-light)';
-                          label = 'OFF';
-                          color = 'var(--text-muted)';
-                        } else if (cell.templateName?.includes('Morning') || cell.templateName?.includes('Main')) {
-                          bg = 'var(--primary-light)';
-                          label = 'MORN';
-                          color = 'var(--primary)';
-                        } else if (cell.templateName?.includes('Evening')) {
-                          bg = 'var(--accent-light)';
-                          label = 'EVE';
-                          color = 'var(--accent)';
-                        } else if (cell.templateName?.includes('Split')) {
-                          bg = 'var(--status-warning-bg)';
-                          label = 'SPLIT';
-                          color = 'var(--status-warning)';
-                        } else {
-                          bg = 'var(--status-info-bg)';
-                          label = 'WORK';
-                          color = 'var(--status-info-text)';
-                        }
-                      }
-
-                      return (
-                        <td
-                          key={d}
-                          style={{
-                            textAlign: 'center',
-                            padding: '0.25rem',
-                            borderRight: '1px solid var(--border-subtle)',
-                          }}
-                        >
-                          <div
-                            style={{
-                              backgroundColor: bg,
-                              color: color,
-                              fontWeight: 700,
-                              fontSize: '0.68rem',
-                              padding: '0.35rem 0.1rem',
-                              borderRadius: 4,
-                            }}
-                          >
-                            {label}
-                          </div>
-                        </td>
-                      );
-                    })}
-                  </tr>
-                ))
-              )}
-            </tbody>
-          </table>
-        </div>
-      </div>
-
-      {/* Bulk Shift Generator Modal */}
-      {showBulkModal && (
-        <div className="modal-backdrop" onClick={() => setShowBulkModal(false)}>
-          <div className="modal-content" style={{ maxWidth: '600px' }} onClick={(e) => e.stopPropagation()}>
-            <div className="modal-header">
-              <h2 className="modal-title">Bulk Shift Generator</h2>
-            </div>
-
-            {modalError && (
               <div
                 style={{
                   display: 'flex',
                   alignItems: 'center',
-                  gap: '0.5rem',
-                  padding: '0.75rem',
-                  backgroundColor: 'var(--status-danger-bg)',
-                  border: '1px solid var(--status-danger-border)',
+                  gap: '0.4rem',
+                  padding: '0.35rem 0.85rem',
+                  backgroundColor: 'var(--bg-surface)',
+                  border: '1px solid var(--border-light)',
                   borderRadius: 'var(--radius-md)',
-                  color: 'var(--status-danger-text)',
-                  fontSize: '0.8125rem',
-                  marginBottom: '1rem',
+                  fontWeight: 650,
+                  fontSize: '0.875rem',
+                  minWidth: '150px',
+                  justifyContent: 'center',
                 }}
               >
-                <AlertCircle size={16} />
-                <span>{modalError}</span>
+                <Calendar size={16} color="var(--primary)" />
+                <span>{monthLabel(selectedMonth)}</span>
               </div>
-            )}
 
-            <form
-              onSubmit={(e) => {
-                e.preventDefault();
-                setModalError(null);
-                previewMutation.mutate(bulkForm);
-              }}
-            >
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
-                <div className="form-group">
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.35rem' }}>
-                    <label className="form-label" style={{ marginBottom: 0 }}>
-                      Select Employees ({bulkForm.employeeIds.length} of {employees.length})
-                    </label>
-                    <button
-                      type="button"
-                      className="btn btn-secondary btn-sm"
-                      style={{ padding: '0.2rem 0.5rem', fontSize: '0.7rem' }}
-                      onClick={handleSelectAllEmployees}
+              <button
+                type="button"
+                className="btn btn-secondary btn-sm btn-icon"
+                title="Next Month"
+                onClick={() => handleMonthChange(shiftMonth(selectedMonth, 1))}
+              >
+                <ChevronRight size={16} />
+              </button>
+
+              {selectedMonth !== currentMonth() && (
+                <button
+                  type="button"
+                  className="btn btn-ghost btn-sm"
+                  onClick={() => handleMonthChange(currentMonth())}
+                >
+                  Current Month
+                </button>
+              )}
+            </div>
+
+            <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
+              {cellFeedback && (
+                <div
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '0.35rem',
+                    fontSize: '0.75rem',
+                    color: 'var(--status-success-text)',
+                    fontWeight: 600,
+                  }}
+                >
+                  <CheckCircle2 size={14} />
+                  <span>{cellFeedback}</span>
+                </div>
+              )}
+              <span className="badge badge-success" style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
+                <CheckCircle2 size={13} />
+                <span>Live Synced</span>
+              </span>
+            </div>
+          </div>
+
+          {/* Grid Legend */}
+          <div
+            className="card"
+            style={{
+              padding: '0.75rem 1.25rem',
+              marginBottom: '1rem',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '1.5rem',
+              flexWrap: 'wrap',
+            }}
+          >
+            <div style={{ fontSize: '0.8125rem', fontWeight: 600, color: 'var(--text-muted)' }}>
+              Shift Legend:
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.75rem' }}>
+              <span style={{ width: 12, height: 12, borderRadius: 3, backgroundColor: 'var(--primary)' }} />
+              <span>Morning Shift</span>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.75rem' }}>
+              <span style={{ width: 12, height: 12, borderRadius: 3, backgroundColor: 'var(--accent)' }} />
+              <span>Evening Shift</span>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.75rem' }}>
+              <span style={{ width: 12, height: 12, borderRadius: 3, backgroundColor: 'var(--status-warning)' }} />
+              <span>Split Shift</span>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.75rem' }}>
+              <span
+                style={{
+                  width: 12,
+                  height: 12,
+                  borderRadius: 3,
+                  backgroundColor: 'var(--border-light)',
+                  border: '1px solid var(--border-strong)',
+                }}
+              />
+              <span>Day Off (OFF)</span>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.75rem', color: 'var(--text-muted)' }}>
+              <span>Select dropdown in any cell to change live.</span>
+            </div>
+          </div>
+
+          {/* Matrix Table */}
+          <div className="card" style={{ padding: 0 }}>
+            <div className="table-container" style={{ border: 'none', maxHeight: '70vh' }}>
+              <table className="table" style={{ fontSize: '0.75rem' }}>
+                <thead style={{ position: 'sticky', top: 0, zIndex: 10 }}>
+                  <tr>
+                    <th
+                      style={{
+                        minWidth: 160,
+                        position: 'sticky',
+                        left: 0,
+                        zIndex: 20,
+                        backgroundColor: 'var(--bg-surface-subtle)',
+                      }}
                     >
-                      {bulkForm.employeeIds.length === employees.length ? 'Deselect All' : 'Select All'}
-                    </button>
-                  </div>
-                  <div
-                    style={{
-                      maxHeight: '130px',
-                      overflowY: 'auto',
-                      border: '1px solid var(--border-light)',
-                      borderRadius: 'var(--radius-md)',
-                      padding: '0.5rem',
-                      display: 'grid',
-                      gridTemplateColumns: 'repeat(2, 1fr)',
-                      gap: '0.35rem',
-                    }}
-                  >
-                    {employees.map((emp) => (
-                      <label key={emp.id} style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.8125rem', cursor: 'pointer' }}>
-                        <input
-                          type="checkbox"
-                          checked={bulkForm.employeeIds.includes(emp.id)}
-                          onChange={(e) => {
-                            if (e.target.checked) {
-                              setBulkForm({ ...bulkForm, employeeIds: [...bulkForm.employeeIds, emp.id] });
-                            } else {
-                              setBulkForm({ ...bulkForm, employeeIds: bulkForm.employeeIds.filter((id) => id !== emp.id) });
-                            }
-                          }}
-                        />
-                        <span>{emp.fullName}</span>
-                      </label>
-                    ))}
-                  </div>
-                </div>
+                      Employee
+                    </th>
+                    {dayNumbers.map((d) => {
+                      const dStr = d < 10 ? `0${d}` : `${d}`;
+                      const dateObj = new Date(`${selectedMonth}-${dStr}T00:00:00Z`);
+                      const dayName = dateObj.toLocaleDateString('en-US', {
+                        weekday: 'narrow',
+                        timeZone: 'UTC',
+                      });
+                      const isWeekend = dateObj.getUTCDay() === 0;
 
-                <div className="grid-2">
-                  <div className="form-group">
-                    <label className="form-label">From Date</label>
-                    <input
-                      type="date"
-                      className="input"
-                      required
-                      value={bulkForm.startDate}
-                      onChange={(e) => setBulkForm({ ...bulkForm, startDate: e.target.value })}
-                    />
-                  </div>
-                  <div className="form-group">
-                    <label className="form-label">To Date</label>
-                    <input
-                      type="date"
-                      className="input"
-                      required
-                      value={bulkForm.endDate}
-                      onChange={(e) => setBulkForm({ ...bulkForm, endDate: e.target.value })}
-                    />
-                  </div>
-                </div>
-
-                <div className="form-group">
-                  <label className="form-label">Apply on</label>
-                  <div className="segmented" style={{ alignSelf: 'flex-start', flexWrap: 'wrap' }}>
-                    {['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'].map((label, i) => {
-                      const day = i + 1;
-                      const on = bulkForm.weekdays.includes(day);
                       return (
-                        <button
-                          type="button"
-                          key={label}
-                          className={on ? 'active' : ''}
-                          onClick={() =>
-                            setBulkForm({
-                              ...bulkForm,
-                              weekdays: on ? bulkForm.weekdays.filter((d) => d !== day) : [...bulkForm.weekdays, day].sort(),
-                            })
-                          }
+                        <th
+                          key={d}
+                          style={{
+                            textAlign: 'center',
+                            minWidth: 42,
+                            padding: '0.4rem 0.2rem',
+                            backgroundColor: isWeekend ? 'var(--status-danger-bg)' : undefined,
+                            color: isWeekend ? 'var(--status-danger-text)' : undefined,
+                          }}
                         >
-                          {label}
-                        </button>
+                          <div>{dayName}</div>
+                          <div style={{ fontWeight: 700 }}>{d}</div>
+                        </th>
                       );
                     })}
-                  </div>
-                  <span className="form-hint">Only the selected weekdays inside the date range are generated.</span>
-                </div>
+                  </tr>
+                </thead>
+                <tbody>
+                  {isLoading ? (
+                    <tr>
+                      <td colSpan={daysInMonth + 1} style={{ textAlign: 'center', padding: '2rem' }}>
+                        Loading schedules...
+                      </td>
+                    </tr>
+                  ) : employees.length === 0 ? (
+                    <tr>
+                      <td colSpan={daysInMonth + 1} style={{ textAlign: 'center', padding: '2rem' }}>
+                        No active employees configured.
+                      </td>
+                    </tr>
+                  ) : (
+                    employees.map((emp) => (
+                      <tr key={emp.id}>
+                        <td
+                          style={{
+                            position: 'sticky',
+                            left: 0,
+                            backgroundColor: '#fff',
+                            zIndex: 5,
+                            fontWeight: 600,
+                            borderRight: '1px solid var(--border-light)',
+                          }}
+                        >
+                          <div>{emp.fullName}</div>
+                          <div className="mono" style={{ fontSize: '0.68rem', color: 'var(--text-muted)' }}>
+                            {emp.employeeNumber}
+                          </div>
+                        </td>
 
-                <div className="grid-2">
-                  <div className="form-group">
-                    <label className="form-label">Day Classification</label>
-                    <select
-                      className="select"
-                      value={bulkForm.dayType}
-                      onChange={(e) => setBulkForm({ ...bulkForm, dayType: e.target.value as any })}
-                    >
-                      <option value="WORK">Working Day</option>
-                      <option value="OFF">Day Off</option>
-                    </select>
-                  </div>
+                        {dayNumbers.map((d) => {
+                          const dStr = d < 10 ? `0${d}` : `${d}`;
+                          const workDate = `${selectedMonth}-${dStr}`;
+                          const cell = scheduleMap.get(`${emp.id}_${workDate}`);
 
-                  {bulkForm.dayType === 'WORK' && (
-                    <div className="form-group">
-                      <label className="form-label">Shift Template</label>
-                      <select
-                        className="select"
-                        required
-                        value={bulkForm.shiftTemplateId}
-                        onChange={(e) => setBulkForm({ ...bulkForm, shiftTemplateId: e.target.value })}
-                      >
-                        <option value="">Select template...</option>
-                        {templates.map((tmpl) => (
-                          <option key={tmpl.id} value={tmpl.id}>
-                            {tmpl.name} ({tmpl.intervals?.[0]?.startLocalTime?.slice(0, 5)} - {tmpl.intervals?.[0]?.endLocalTime?.slice(0, 5)})
-                          </option>
-                        ))}
-                      </select>
-                    </div>
+                          let bg = 'var(--bg-surface-subtle)';
+                          let label = '-';
+                          let color = 'var(--text-subtle)';
+
+                          if (cell) {
+                            if (cell.dayType === 'OFF') {
+                              bg = 'var(--border-light)';
+                              label = 'OFF';
+                              color = 'var(--text-muted)';
+                            } else if (cell.templateName?.includes('Morning') || cell.templateName?.includes('Main')) {
+                              bg = 'var(--primary-light)';
+                              label = 'MORN';
+                              color = 'var(--primary)';
+                            } else if (cell.templateName?.includes('Evening')) {
+                              bg = 'var(--accent-light)';
+                              label = 'EVE';
+                              color = 'var(--accent)';
+                            } else if (cell.templateName?.includes('Split')) {
+                              bg = 'var(--status-warning-bg)';
+                              label = 'SPLIT';
+                              color = 'var(--status-warning)';
+                            } else {
+                              bg = 'var(--status-info-bg)';
+                              label = 'WORK';
+                              color = 'var(--status-info-text)';
+                            }
+                          }
+
+                          return (
+                            <td
+                              key={d}
+                              style={{
+                                textAlign: 'center',
+                                padding: '0.15rem',
+                                borderRight: '1px solid var(--border-subtle)',
+                              }}
+                            >
+                              <select
+                                style={{
+                                  backgroundColor: bg,
+                                  color: color,
+                                  fontWeight: 700,
+                                  fontSize: '0.68rem',
+                                  padding: '0.35rem 0.05rem',
+                                  borderRadius: 4,
+                                  border: '1px solid transparent',
+                                  width: '100%',
+                                  cursor: 'pointer',
+                                  textAlign: 'center',
+                                  appearance: 'none',
+                                  outline: 'none',
+                                }}
+                                value={cell?.dayType === 'OFF' ? 'OFF' : cell?.sourceTemplateId || ''}
+                                onChange={(e) => handleQuickCellChange(emp.id, workDate, e.target.value)}
+                                title={`${emp.fullName} - ${workDate}: ${cell?.templateName || label}`}
+                              >
+                                <option value="">-</option>
+                                <option value="OFF">OFF</option>
+                                {templates.map((tmpl) => (
+                                  <option key={tmpl.id} value={tmpl.id}>
+                                    {tmpl.name}
+                                  </option>
+                                ))}
+                              </select>
+                            </td>
+                          );
+                        })}
+                      </tr>
+                    ))
                   )}
-                </div>
-
-                {/* Preview Results Box */}
-                {previewResult && (
-                  <div
-                    style={{
-                      padding: '0.85rem',
-                      backgroundColor: 'var(--status-info-bg)',
-                      border: '1px solid var(--status-info-border)',
-                      borderRadius: 'var(--radius-md)',
-                      fontSize: '0.8125rem',
-                    }}
-                  >
-                    <div style={{ fontWeight: 600, color: 'var(--status-info-text)', marginBottom: '0.25rem' }}>
-                      Generation Plan Ready
-                    </div>
-                    <div>
-                      Target shifts to write: <strong>{previewResult.totalDaysToGenerate} days</strong>
-                    </div>
-                    <div>
-                      Existing schedule conflicts / overwrites: <strong>{previewResult.conflictCount}</strong>
-                    </div>
-                  </div>
-                )}
-              </div>
-
-              <div className="modal-footer">
-                <button type="button" className="btn btn-secondary" onClick={() => setShowBulkModal(false)}>
-                  Cancel
-                </button>
-                {!previewResult ? (
-                  <button
-                    type="submit"
-                    className="btn btn-secondary"
-                    disabled={previewMutation.isPending || bulkForm.employeeIds.length === 0}
-                  >
-                    {previewMutation.isPending ? 'Analyzing Plan...' : 'Preview Plan'}
-                  </button>
-                ) : (
-                  <button
-                    type="button"
-                    className="btn btn-primary"
-                    disabled={commitMutation.isPending}
-                    onClick={() => commitMutation.mutate(bulkForm)}
-                  >
-                    {commitMutation.isPending ? 'Committing Shifts...' : 'Commit Generated Shifts'}
-                  </button>
-                )}
-              </div>
-            </form>
+                </tbody>
+              </table>
+            </div>
           </div>
-        </div>
+        </>
       )}
     </div>
   );

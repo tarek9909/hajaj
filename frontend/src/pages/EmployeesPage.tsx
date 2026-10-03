@@ -2,7 +2,7 @@ import { todayIso, nextMonthStart } from '../lib/format';
 import React, { useState } from 'react';
 import { useParams } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { employeesApi, configApi, restaurantApi } from '../lib/api';
+import { employeesApi, configApi, restaurantApi, warningsApi } from '../lib/api';
 import {
   Plus,
   Search,
@@ -10,6 +10,7 @@ import {
   CheckCircle2,
   XCircle,
   AlertCircle,
+  AlertTriangle,
 } from 'lucide-react';
 
 export const EmployeesPage: React.FC = () => {
@@ -22,6 +23,8 @@ export const EmployeesPage: React.FC = () => {
 
   const [showAddModal, setShowAddModal] = useState(false);
   const [selectedEmployeeForSalary, setSelectedEmployeeForSalary] = useState<any | null>(null);
+  const [selectedEmployeeForWarning, setSelectedEmployeeForWarning] = useState<any | null>(null);
+  const [warningSuccessMessage, setWarningSuccessMessage] = useState<string | null>(null);
   const [modalError, setModalError] = useState<string | null>(null);
   const [listError, setListError] = useState<string | null>(null);
 
@@ -43,6 +46,14 @@ export const EmployeesPage: React.FC = () => {
     reason: 'Annual salary review',
   });
 
+  // Send Warning State
+  const [warningForm, setWarningForm] = useState({
+    incidentDate: todayIso(),
+    title: 'Administrative Warning',
+    reason: '',
+    countsTowardLimit: true,
+  });
+
   const { data: restaurant } = useQuery({
     queryKey: ['restaurant-info', restaurantId],
     queryFn: () => restaurantApi.getProfile(restaurantId),
@@ -56,6 +67,11 @@ export const EmployeesPage: React.FC = () => {
   const { data: employees = [], isLoading } = useQuery({
     queryKey: ['employees', restaurantId],
     queryFn: () => employeesApi.list(restaurantId),
+  });
+
+  const { data: warningsData } = useQuery({
+    queryKey: ['warnings', restaurantId],
+    queryFn: () => warningsApi.list(restaurantId),
   });
 
   const createMutation = useMutation({
@@ -108,6 +124,29 @@ export const EmployeesPage: React.FC = () => {
     },
   });
 
+  const sendWarningMutation = useMutation({
+    mutationFn: (data: { employeeId: string; incidentDate: string; title: string; reason: string; countsTowardLimit: boolean }) =>
+      warningsApi.createCustom(restaurantId, data),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['warnings'] });
+      queryClient.invalidateQueries({ queryKey: ['reports-warnings'] });
+      queryClient.invalidateQueries({ queryKey: ['payroll-period'] });
+      const empName = selectedEmployeeForWarning?.fullName || 'Employee';
+      setSelectedEmployeeForWarning(null);
+      setWarningSuccessMessage(`Warning successfully issued to ${empName}`);
+      setTimeout(() => setWarningSuccessMessage(null), 4000);
+      setWarningForm({
+        incidentDate: todayIso(),
+        title: 'Administrative Warning',
+        reason: '',
+        countsTowardLimit: true,
+      });
+    },
+    onError: (err: any) => {
+      setModalError(err.message || 'Failed to issue warning');
+    },
+  });
+
   const currency = restaurant?.currencyCode || 'USD';
   const decimals = restaurant?.currencyDecimalPlaces ?? 2;
 
@@ -138,6 +177,28 @@ export const EmployeesPage: React.FC = () => {
           <span>Add Employee</span>
         </button>
       </div>
+
+      {/* Warning Success Toast */}
+      {warningSuccessMessage && (
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: '0.6rem',
+            padding: '0.85rem 1.25rem',
+            backgroundColor: 'var(--status-success-bg)',
+            border: '1px solid var(--status-success-border)',
+            borderRadius: 'var(--radius-md)',
+            color: 'var(--status-success-text)',
+            fontSize: '0.875rem',
+            fontWeight: 600,
+            marginBottom: '1.25rem',
+          }}
+        >
+          <CheckCircle2 size={18} />
+          <span>{warningSuccessMessage}</span>
+        </div>
+      )}
 
       {/* Filter Bar */}
       <div className="card" style={{ padding: '1rem 1.25rem', marginBottom: '1.5rem' }}>
@@ -237,69 +298,121 @@ export const EmployeesPage: React.FC = () => {
                   </td>
                 </tr>
               ) : (
-                filteredEmployees.map((emp) => (
-                  <tr key={emp.id}>
-                    <td className="mono" style={{ fontWeight: 600, color: 'var(--primary)' }}>
-                      {emp.employeeNumber}
-                    </td>
-                    <td>
-                      <div style={{ fontWeight: 600, color: 'var(--text-main)' }}>{emp.fullName}</div>
-                    </td>
-                    <td>
-                      <span className="badge badge-neutral">{emp.positionName}</span>
-                    </td>
-                    <td className="mono" style={{ fontSize: '0.8125rem' }}>
-                      {emp.mobile}
-                    </td>
-                    <td className="mono" style={{ fontSize: '0.8125rem' }}>
-                      {emp.employmentStartDate}
-                    </td>
-                    <td>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                        <span className="tabular-nums" style={{ fontWeight: 600 }}>
-                          {currency} {Number(emp.monthlySalary || 0).toFixed(decimals)}
+                filteredEmployees.map((emp) => {
+                  const warnStats = warningsData?.employeeWarningCounts?.[emp.id];
+                  const warningCount = warnStats?.counted ?? 0;
+                  const warningLimitReached = Boolean(warnStats?.limitReached);
+
+                  return (
+                    <tr key={emp.id}>
+                      <td className="mono" style={{ fontWeight: 600, color: 'var(--primary)' }}>
+                        {emp.employeeNumber}
+                      </td>
+                      <td>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
+                          <span style={{ fontWeight: 600, color: 'var(--text-main)' }}>{emp.fullName}</span>
+                          {warningCount > 0 && (
+                            <span
+                              className={`badge ${warningLimitReached ? 'badge-danger' : 'badge-warning'}`}
+                              style={{
+                                fontSize: '0.68rem',
+                                padding: '0.1rem 0.45rem',
+                                display: 'inline-flex',
+                                alignItems: 'center',
+                                gap: '0.25rem',
+                              }}
+                              title={`${warningCount} warning(s) on record${warningLimitReached ? ' — Threshold limit reached!' : ''}`}
+                            >
+                              <AlertTriangle size={11} />
+                              <span>{warningCount} warn{warningLimitReached ? ' (Limit)' : ''}</span>
+                            </span>
+                          )}
+                        </div>
+                      </td>
+                      <td>
+                        <span className="badge badge-neutral">{emp.positionName}</span>
+                      </td>
+                      <td className="mono" style={{ fontSize: '0.8125rem' }}>
+                        {emp.mobile}
+                      </td>
+                      <td className="mono" style={{ fontSize: '0.8125rem' }}>
+                        {emp.employmentStartDate}
+                      </td>
+                      <td>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                          <span className="tabular-nums" style={{ fontWeight: 600 }}>
+                            {currency} {Number(emp.monthlySalary || 0).toFixed(decimals)}
+                          </span>
+                          <button
+                            className="btn btn-secondary btn-sm"
+                            style={{ padding: '0.2rem 0.4rem', fontSize: '0.7rem' }}
+                            title="Salary Timeline & Revisions"
+                            onClick={() => {
+                              setModalError(null);
+                              setSelectedEmployeeForSalary(emp);
+                              setSalaryForm({
+                                effectiveFromMonth: nextMonthStart(),
+                                monthlySalary: String(emp.monthlySalary || ''),
+                                reason: 'Salary adjustment',
+                              });
+                            }}
+                          >
+                            <History size={12} />
+                            <span>History</span>
+                          </button>
+                        </div>
+                      </td>
+                      <td>
+                        <span className={`badge ${emp.status === 'ACTIVE' ? 'badge-success' : 'badge-danger'}`}>
+                          {emp.status === 'ACTIVE' ? <CheckCircle2 size={12} /> : <XCircle size={12} />}
+                          <span>{emp.status}</span>
                         </span>
-                        <button
-                          className="btn btn-secondary btn-sm"
-                          style={{ padding: '0.2rem 0.4rem', fontSize: '0.7rem' }}
-                          title="Salary Timeline & Revisions"
-                          onClick={() => {
-                            setModalError(null);
-                            setSelectedEmployeeForSalary(emp);
-                            setSalaryForm({
-                              effectiveFromMonth: nextMonthStart(),
-                              monthlySalary: String(emp.monthlySalary || ''),
-                              reason: 'Salary adjustment',
-                            });
-                          }}
-                        >
-                          <History size={12} />
-                          <span>History</span>
-                        </button>
-                      </div>
-                    </td>
-                    <td>
-                      <span className={`badge ${emp.status === 'ACTIVE' ? 'badge-success' : 'badge-danger'}`}>
-                        {emp.status === 'ACTIVE' ? <CheckCircle2 size={12} /> : <XCircle size={12} />}
-                        <span>{emp.status}</span>
-                      </span>
-                    </td>
-                    <td style={{ textAlign: 'right' }}>
-                      <button
-                        className="btn btn-secondary btn-sm"
-                        onClick={() =>
-                          updateStatusMutation.mutate({
-                            id: emp.id,
-                            status: emp.status === 'ACTIVE' ? 'INACTIVE' : 'ACTIVE',
-                            version: emp.rowVersion,
-                          })
-                        }
-                      >
-                        {emp.status === 'ACTIVE' ? 'Deactivate' : 'Reactivate'}
-                      </button>
-                    </td>
-                  </tr>
-                ))
+                      </td>
+                      <td style={{ textAlign: 'right' }}>
+                        <div style={{ display: 'flex', gap: '0.4rem', justifyContent: 'flex-end', alignItems: 'center' }}>
+                          <button
+                            className="btn btn-secondary btn-sm"
+                            style={{
+                              color: 'var(--status-warning)',
+                              borderColor: 'rgba(217, 119, 6, 0.35)',
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: '0.35rem',
+                              padding: '0.25rem 0.55rem',
+                              fontSize: '0.75rem',
+                            }}
+                            title={`Send warning to ${emp.fullName}`}
+                            onClick={() => {
+                              setModalError(null);
+                              setSelectedEmployeeForWarning(emp);
+                              setWarningForm({
+                                incidentDate: todayIso(),
+                                title: 'Administrative Warning',
+                                reason: '',
+                                countsTowardLimit: true,
+                              });
+                            }}
+                          >
+                            <AlertTriangle size={13} />
+                            <span>Send Warning</span>
+                          </button>
+                          <button
+                            className="btn btn-secondary btn-sm"
+                            onClick={() =>
+                              updateStatusMutation.mutate({
+                                id: emp.id,
+                                status: emp.status === 'ACTIVE' ? 'INACTIVE' : 'ACTIVE',
+                                version: emp.rowVersion,
+                              })
+                            }
+                          >
+                            {emp.status === 'ACTIVE' ? 'Deactivate' : 'Reactivate'}
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })
               )}
             </tbody>
           </table>
@@ -519,6 +632,175 @@ export const EmployeesPage: React.FC = () => {
                 </button>
                 <button type="submit" className="btn btn-primary" disabled={addSalaryMutation.isPending}>
                   {addSalaryMutation.isPending ? 'Committing...' : 'Commit Revision'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Send Warning Modal */}
+      {selectedEmployeeForWarning && (
+        <div className="modal-backdrop" onClick={() => setSelectedEmployeeForWarning(null)}>
+          <div className="modal-content" style={{ maxWidth: '540px' }} onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem' }}>
+                <div
+                  style={{
+                    width: 36,
+                    height: 36,
+                    borderRadius: 'var(--radius-md)',
+                    backgroundColor: 'var(--status-warning-bg)',
+                    color: 'var(--status-warning)',
+                    display: 'grid',
+                    placeItems: 'center',
+                  }}
+                >
+                  <AlertTriangle size={18} />
+                </div>
+                <div>
+                  <h2 className="modal-title">Send Custom Warning</h2>
+                  <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
+                    To: <strong>{selectedEmployeeForWarning.fullName}</strong> ({selectedEmployeeForWarning.employeeNumber}) · {selectedEmployeeForWarning.positionName}
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {modalError && (
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '0.5rem',
+                  padding: '0.75rem',
+                  backgroundColor: 'var(--status-danger-bg)',
+                  border: '1px solid var(--status-danger-border)',
+                  borderRadius: 'var(--radius-md)',
+                  color: 'var(--status-danger-text)',
+                  fontSize: '0.8125rem',
+                  marginBottom: '1rem',
+                }}
+              >
+                <AlertCircle size={16} />
+                <span>{modalError}</span>
+              </div>
+            )}
+
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                setModalError(null);
+                sendWarningMutation.mutate({
+                  employeeId: selectedEmployeeForWarning.id,
+                  incidentDate: warningForm.incidentDate,
+                  title: warningForm.title,
+                  reason: warningForm.reason,
+                  countsTowardLimit: warningForm.countsTowardLimit,
+                });
+              }}
+            >
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+                {/* Category Presets */}
+                <div>
+                  <label className="form-label" style={{ marginBottom: '0.4rem' }}>
+                    Quick Categories
+                  </label>
+                  <div style={{ display: 'flex', gap: '0.35rem', flexWrap: 'wrap' }}>
+                    {[
+                      'Unexcused Absence',
+                      'Excessive Lateness',
+                      'Dress Code Violation',
+                      'Insubordination',
+                      'Safety Violation',
+                      'Customer Service Issue',
+                    ].map((preset) => (
+                      <button
+                        type="button"
+                        key={preset}
+                        className="btn btn-ghost btn-sm"
+                        style={{
+                          fontSize: '0.72rem',
+                          padding: '0.2rem 0.5rem',
+                          backgroundColor: warningForm.title === preset ? 'var(--primary-light)' : 'var(--bg-surface-subtle)',
+                          color: warningForm.title === preset ? 'var(--primary)' : 'var(--text-main)',
+                          borderColor: warningForm.title === preset ? 'var(--primary)' : 'var(--border-subtle)',
+                        }}
+                        onClick={() => setWarningForm({ ...warningForm, title: preset })}
+                      >
+                        {preset}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="grid-2">
+                  <div className="form-group">
+                    <label className="form-label">Warning Title / Subject</label>
+                    <input
+                      type="text"
+                      className="input"
+                      required
+                      placeholder="e.g. Unexcused Absence"
+                      value={warningForm.title}
+                      onChange={(e) => setWarningForm({ ...warningForm, title: e.target.value })}
+                    />
+                  </div>
+
+                  <div className="form-group">
+                    <label className="form-label">Incident Date</label>
+                    <input
+                      type="date"
+                      className="input mono"
+                      required
+                      value={warningForm.incidentDate}
+                      onChange={(e) => setWarningForm({ ...warningForm, incidentDate: e.target.value })}
+                    />
+                  </div>
+                </div>
+
+                <div className="form-group">
+                  <label className="form-label">Details / Explanation</label>
+                  <textarea
+                    className="textarea"
+                    rows={3}
+                    required
+                    placeholder="Describe the incident, policy violation, and any corrective action discussed with the employee..."
+                    value={warningForm.reason}
+                    onChange={(e) => setWarningForm({ ...warningForm, reason: e.target.value })}
+                  />
+                </div>
+
+                <div className="form-group" style={{ marginBottom: 0 }}>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer', fontSize: '0.8125rem' }}>
+                    <input
+                      type="checkbox"
+                      checked={warningForm.countsTowardLimit}
+                      onChange={(e) => setWarningForm({ ...warningForm, countsTowardLimit: e.target.checked })}
+                    />
+                    <span>
+                      Counts toward monthly penalty threshold ({warningsData?.threshold ?? 3} warnings = threshold limit)
+                    </span>
+                  </label>
+                </div>
+              </div>
+
+              <div className="modal-footer" style={{ marginTop: '1.25rem' }}>
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  onClick={() => setSelectedEmployeeForWarning(null)}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="btn btn-primary"
+                  style={{ backgroundColor: 'var(--status-warning)', borderColor: 'var(--status-warning)' }}
+                  disabled={sendWarningMutation.isPending || !warningForm.title.trim() || !warningForm.reason.trim()}
+                >
+                  <AlertTriangle size={15} />
+                  <span>{sendWarningMutation.isPending ? 'Sending...' : 'Issue Warning'}</span>
                 </button>
               </div>
             </form>

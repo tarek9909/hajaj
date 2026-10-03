@@ -20,8 +20,63 @@ const toYmd = (value: unknown): string | null => {
 
 const XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
 
-/** Builds the payroll summary workbook with numeric cells and currency-aware number formats. */
-async function buildPayrollWorkbook(month: string, empRows: RowDataPacket[], currencyDecimals: number): Promise<Buffer> {
+function populateWarningsSheet(workbook: ExcelJS.Workbook, month: string, warnRows: RowDataPacket[]) {
+  const sheet = workbook.addWorksheet(`Warnings ${month}`);
+  sheet.columns = [
+    { header: 'Date', key: 'incident_date', width: 14 },
+    { header: 'Ref #', key: 'ref', width: 12 },
+    { header: 'Employee Name', key: 'name', width: 25 },
+    { header: 'Position', key: 'pos', width: 18 },
+    { header: 'Origin', key: 'origin', width: 22 },
+    { header: 'Warning Title', key: 'title', width: 25 },
+    { header: 'Reason / Details', key: 'reason', width: 35 },
+    { header: 'Late (min)', key: 'late_minutes', width: 12 },
+    { header: 'Counts Limit', key: 'counts_toward_limit', width: 14 },
+    { header: 'Status', key: 'status', width: 14 },
+    { header: 'Void Reason', key: 'void_reason', width: 25 },
+    { header: 'Voided By', key: 'voided_by', width: 20 },
+    { header: 'Issued By', key: 'created_by', width: 20 },
+    { header: 'Recorded At', key: 'created_at', width: 18 },
+  ];
+
+  for (const w of warnRows) {
+    const isVoided = Boolean(w.admin_voided);
+    const status = isVoided ? 'VOIDED' : (w.system_qualifies ? 'ACTIVE' : 'NON-QUALIFYING');
+    const originLabel = w.origin === 'AUTOMATIC_LATENESS' ? 'Automatic Lateness' : 'Custom Administrative';
+
+    sheet.addRow({
+      incident_date: w.incident_date,
+      ref: w.employee_number,
+      name: w.full_name,
+      pos: w.position_name,
+      origin: originLabel,
+      title: w.title || (w.origin === 'AUTOMATIC_LATENESS' ? 'Automated Lateness Penalty' : 'Administrative Warning'),
+      reason: w.reason || '-',
+      late_minutes: w.late_minutes ?? '-',
+      counts_toward_limit: w.counts_toward_limit ? 'YES' : 'NO',
+      status,
+      void_reason: w.void_reason || '-',
+      voided_by: w.voided_by_name || '-',
+      created_by: w.created_by_name || 'System Auto',
+      created_at: w.created_at,
+    });
+  }
+
+  sheet.getRow(1).font = { bold: true };
+  sheet.getRow(1).fill = {
+    type: 'pattern',
+    pattern: 'solid',
+    fgColor: { argb: 'FFEFEFEF' },
+  };
+}
+
+/** Builds the payroll summary workbook with numeric cells, currency-aware number formats, and warnings sheet. */
+async function buildPayrollWorkbook(
+  month: string,
+  empRows: RowDataPacket[],
+  warnRows: RowDataPacket[],
+  currencyDecimals: number
+): Promise<Buffer> {
   const moneyFmt = currencyDecimals > 0 ? `#,##0.${'0'.repeat(currencyDecimals)}` : '#,##0';
   const hoursFmt = '0.00';
   const workbook = new ExcelJS.Workbook();
@@ -83,6 +138,9 @@ async function buildPayrollWorkbook(month: string, empRows: RowDataPacket[], cur
     fgColor: { argb: 'FFEFEFEF' },
   };
 
+  // Add Warnings sheet
+  populateWarningsSheet(workbook, month, warnRows);
+
   return Buffer.from(await workbook.xlsx.writeBuffer());
 }
 
@@ -111,7 +169,38 @@ async function sendPayrollXlsx(restaurantId: string | number, month: string, res
   );
   const decimals = restRows[0] ? Number(restRows[0].currency_decimal_places) : 2;
 
-  const buffer = await buildPayrollWorkbook(month, empRows, decimals);
+  const [warnRows] = await pool.execute<RowDataPacket[]>(
+    `SELECT 
+      w.id,
+      w.employee_id,
+      e.full_name,
+      e.employee_number,
+      p.name AS position_name,
+      w.origin,
+      DATE_FORMAT(w.incident_date, '%Y-%m-%d') AS incident_date,
+      w.title,
+      w.reason,
+      w.late_minutes,
+      w.system_qualifies,
+      w.counts_toward_limit,
+      w.admin_voided,
+      w.void_reason,
+      DATE_FORMAT(w.voided_at, '%Y-%m-%d %H:%i') AS voided_at,
+      DATE_FORMAT(w.created_at, '%Y-%m-%d %H:%i') AS created_at,
+      va.full_name AS voided_by_name,
+      ca.full_name AS created_by_name
+     FROM warnings w
+     JOIN employees e ON e.id = w.employee_id
+     JOIN positions p ON p.id = e.position_id
+     LEFT JOIN admin_accounts va ON va.id = w.voided_by
+     LEFT JOIN admin_accounts ca ON ca.id = w.created_by
+     WHERE w.restaurant_id = ? 
+       AND w.incident_date >= ? AND w.incident_date < DATE_ADD(?, INTERVAL 1 MONTH)
+     ORDER BY w.incident_date DESC, w.created_at DESC`,
+    [restaurantId, `${month}-01`, `${month}-01`]
+  );
+
+  const buffer = await buildPayrollWorkbook(month, empRows, warnRows, decimals);
   res.setHeader('Content-Type', XLSX_MIME);
   res.setHeader('Content-Disposition', `attachment; filename="Payroll_Summary_${month}.xlsx"`);
   res.send(buffer);
@@ -437,6 +526,59 @@ reportRouter.get('/debt', async (req: Request, res: Response, next: NextFunction
   }
 });
 
+async function buildWarningsWorkbook(
+  month: string,
+  warnRows: RowDataPacket[],
+  summaryRows: RowDataPacket[],
+  threshold: number
+): Promise<Buffer> {
+  const workbook = new ExcelJS.Workbook();
+  workbook.creator = 'Restaurant Workforce Management Platform';
+  workbook.created = new Date();
+
+  // Sheet 1: Warning Summary by Employee
+  const summarySheet = workbook.addWorksheet(`Summary ${month}`);
+  summarySheet.columns = [
+    { header: 'Ref #', key: 'ref', width: 12 },
+    { header: 'Employee Name', key: 'name', width: 25 },
+    { header: 'Position', key: 'pos', width: 18 },
+    { header: 'Auto Lateness', key: 'auto', width: 16 },
+    { header: 'Custom Admin', key: 'custom', width: 16 },
+    { header: 'Valid Warnings', key: 'valid', width: 16 },
+    { header: 'Counted Warnings', key: 'counted', width: 18 },
+    { header: 'Monthly Limit', key: 'limit', width: 14 },
+    { header: 'Status', key: 'status', width: 16 },
+  ];
+
+  for (const s of summaryRows) {
+    const counted = Number(s.counted_warning_count);
+    const limitReached = counted >= threshold;
+    summarySheet.addRow({
+      ref: s.employee_number,
+      name: s.full_name,
+      pos: s.position_name,
+      auto: Number(s.automatic_warning_count),
+      custom: Number(s.custom_warning_count),
+      valid: Number(s.valid_warning_count),
+      counted,
+      limit: threshold,
+      status: limitReached ? 'LIMIT EXCEEDED' : 'SAFE',
+    });
+  }
+
+  summarySheet.getRow(1).font = { bold: true };
+  summarySheet.getRow(1).fill = {
+    type: 'pattern',
+    pattern: 'solid',
+    fgColor: { argb: 'FFEFEFEF' },
+  };
+
+  // Sheet 2: Detailed Warnings Ledger
+  populateWarningsSheet(workbook, month, warnRows);
+
+  return Buffer.from(await workbook.xlsx.writeBuffer());
+}
+
 // GET /api/v1/restaurants/:restaurantId/reports/warnings?month=YYYY-MM
 reportRouter.get('/warnings', async (req: Request, res: Response, next: NextFunction) => {
   try {
@@ -444,7 +586,7 @@ reportRouter.get('/warnings', async (req: Request, res: Response, next: NextFunc
     const month = parseMonth(req.query.month);
     const monthStart = `${month}-01`;
 
-    const [rows] = await pool.execute<RowDataPacket[]>(
+    const [summaryRows] = await pool.execute<RowDataPacket[]>(
       `SELECT 
         v.*,
         e.full_name,
@@ -453,21 +595,105 @@ reportRouter.get('/warnings', async (req: Request, res: Response, next: NextFunc
        FROM v_warning_monthly_counts v
        JOIN employees e ON e.id = v.employee_id
        JOIN positions p ON p.id = e.position_id
-       WHERE v.restaurant_id = ? AND v.month_start = ?`,
+       WHERE v.restaurant_id = ? AND v.month_start = ?
+       ORDER BY v.counted_warning_count DESC, e.full_name ASC`,
       [restaurantId, monthStart]
     );
 
+    const [warnRows] = await pool.execute<RowDataPacket[]>(
+      `SELECT 
+        w.id,
+        w.employee_id,
+        e.full_name,
+        e.employee_number,
+        p.name AS position_name,
+        w.origin,
+        DATE_FORMAT(w.incident_date, '%Y-%m-%d') AS incident_date,
+        w.title,
+        w.reason,
+        w.late_minutes,
+        w.system_qualifies,
+        w.counts_toward_limit,
+        w.admin_voided,
+        w.void_reason,
+        DATE_FORMAT(w.voided_at, '%Y-%m-%d %H:%i') AS voided_at,
+        DATE_FORMAT(w.created_at, '%Y-%m-%d %H:%i') AS created_at,
+        va.full_name AS voided_by_name,
+        ca.full_name AS created_by_name
+       FROM warnings w
+       JOIN employees e ON e.id = w.employee_id
+       JOIN positions p ON p.id = e.position_id
+       LEFT JOIN admin_accounts va ON va.id = w.voided_by
+       LEFT JOIN admin_accounts ca ON ca.id = w.created_by
+       WHERE w.restaurant_id = ? 
+         AND w.incident_date >= ? AND w.incident_date < DATE_ADD(?, INTERVAL 1 MONTH)
+       ORDER BY w.incident_date DESC, w.created_at DESC`,
+      [restaurantId, monthStart, monthStart]
+    );
+
+    const [policyRows] = await pool.execute<RowDataPacket[]>(
+      `SELECT warning_threshold FROM restaurant_policy_versions
+       WHERE restaurant_id = ? AND effective_from_month <= ?
+       ORDER BY effective_from_month DESC, revision_no DESC
+       LIMIT 1`,
+      [restaurantId, monthStart]
+    );
+    const threshold = policyRows[0] ? Number(policyRows[0].warning_threshold) : 3;
+
+    if (req.query.format === 'xlsx') {
+      const buffer = await buildWarningsWorkbook(month, warnRows, summaryRows, threshold);
+      res.setHeader('Content-Type', XLSX_MIME);
+      res.setHeader('Content-Disposition', `attachment; filename="Warnings_Report_${month}.xlsx"`);
+      res.send(buffer);
+      return;
+    }
+
     res.json({
-      data: rows.map((r) => ({
-        employeeId: String(r.employee_id),
-        fullName: r.full_name,
-        employeeNumber: r.employee_number,
-        positionName: r.position_name,
-        automaticWarningCount: Number(r.automatic_warning_count),
-        customWarningCount: Number(r.custom_warning_count),
-        validWarningCount: Number(r.valid_warning_count),
-        countedWarningCount: Number(r.counted_warning_count),
-      })),
+      data: {
+        month,
+        threshold,
+        overview: {
+          totalWarnings: warnRows.length,
+          activeWarnings: warnRows.filter((w) => !w.admin_voided && w.system_qualifies).length,
+          voidedWarnings: warnRows.filter((w) => w.admin_voided).length,
+          countedWarnings: warnRows.filter((w) => !w.admin_voided && w.system_qualifies && w.counts_toward_limit).length,
+          automaticCount: warnRows.filter((w) => w.origin === 'AUTOMATIC_LATENESS').length,
+          customCount: warnRows.filter((w) => w.origin === 'CUSTOM_ADMINISTRATIVE').length,
+          employeesAtLimit: summaryRows.filter((s) => Number(s.counted_warning_count) >= threshold).length,
+        },
+        summary: summaryRows.map((r) => ({
+          employeeId: String(r.employee_id),
+          fullName: r.full_name,
+          employeeNumber: r.employee_number,
+          positionName: r.position_name,
+          automaticWarningCount: Number(r.automatic_warning_count),
+          customWarningCount: Number(r.custom_warning_count),
+          validWarningCount: Number(r.valid_warning_count),
+          countedWarningCount: Number(r.counted_warning_count),
+          limitReached: Number(r.counted_warning_count) >= threshold,
+        })),
+        warnings: warnRows.map((w) => ({
+          id: String(w.id),
+          employeeId: String(w.employee_id),
+          fullName: w.full_name,
+          employeeNumber: w.employee_number,
+          positionName: w.position_name,
+          origin: w.origin,
+          incidentDate: w.incident_date,
+          title: w.title,
+          reason: w.reason,
+          lateMinutes: w.late_minutes,
+          systemQualifies: Boolean(w.system_qualifies),
+          countsTowardLimit: Boolean(w.counts_toward_limit),
+          adminVoided: Boolean(w.admin_voided),
+          status: w.admin_voided ? 'VOIDED' : w.system_qualifies ? 'ACTIVE' : 'NON_QUALIFYING',
+          voidReason: w.void_reason,
+          voidedByName: w.voided_by_name,
+          voidedAt: w.voided_at,
+          createdByName: w.created_by_name,
+          createdAt: w.created_at,
+        })),
+      },
       meta: { requestId: req.requestId },
     });
   } catch (err) {

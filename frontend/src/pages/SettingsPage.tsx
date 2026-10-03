@@ -13,6 +13,7 @@ import {
   AlertCircle,
   CheckCircle2,
   XCircle,
+  Trash2,
 } from 'lucide-react';
 
 export const SettingsPage: React.FC = () => {
@@ -52,6 +53,21 @@ export const SettingsPage: React.FC = () => {
     email: '',
     mobile: '',
     password: '',
+  });
+
+  // Shift Template Form
+  const [templateForm, setTemplateForm] = useState({
+    name: '',
+    intervals: [
+      {
+        sequenceNumber: 1,
+        startLocalTime: '08:00',
+        startDayOffset: 0,
+        endLocalTime: '16:00',
+        endDayOffset: 0,
+        plannedUnpaidBreakMinutes: 0,
+      },
+    ],
   });
 
   const { data: restaurant } = useQuery({
@@ -135,6 +151,82 @@ export const SettingsPage: React.FC = () => {
     },
   });
 
+  const createTemplateMutation = useMutation({
+    mutationFn: (data: typeof templateForm) => configApi.createShiftTemplate(restaurantId, data),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['shift-templates', restaurantId] });
+      setTemplateForm({
+        name: '',
+        intervals: [
+          {
+            sequenceNumber: 1,
+            startLocalTime: '08:00',
+            startDayOffset: 0,
+            endLocalTime: '16:00',
+            endDayOffset: 0,
+            plannedUnpaidBreakMinutes: 0,
+          },
+        ],
+      });
+      setModalType(null);
+    },
+    onError: (err: any) => setModalError(err.message || 'Failed to create shift template'),
+  });
+
+  const calculateIntervalMinutes = (inv: { startLocalTime: string; startDayOffset: number; endLocalTime: string; endDayOffset: number }) => {
+    if (!inv.startLocalTime || !inv.endLocalTime) return 0;
+    const [sh = 0, sm = 0] = inv.startLocalTime.split(':').map(Number);
+    const [eh = 0, em = 0] = inv.endLocalTime.split(':').map(Number);
+    const startMins = inv.startDayOffset * 1440 + sh * 60 + sm;
+    const endMins = inv.endDayOffset * 1440 + eh * 60 + em;
+    return Math.max(0, endMins - startMins);
+  };
+
+  const totalTemplateMinutes = templateForm.intervals.reduce((acc, inv) => acc + calculateIntervalMinutes(inv), 0);
+
+  const handleAddInterval = () => {
+    const last = templateForm.intervals[templateForm.intervals.length - 1];
+    setTemplateForm({
+      ...templateForm,
+      intervals: [
+        ...templateForm.intervals,
+        {
+          sequenceNumber: templateForm.intervals.length + 1,
+          startLocalTime: last?.endLocalTime || '17:00',
+          startDayOffset: 0,
+          endLocalTime: '21:00',
+          endDayOffset: 0,
+          plannedUnpaidBreakMinutes: 0,
+        },
+      ],
+    });
+  };
+
+  const handleRemoveInterval = (index: number) => {
+    if (templateForm.intervals.length <= 1) return;
+    const updated = templateForm.intervals
+      .filter((_, i) => i !== index)
+      .map((inv, idx) => ({ ...inv, sequenceNumber: idx + 1 }));
+    setTemplateForm({ ...templateForm, intervals: updated });
+  };
+
+  const handleUpdateInterval = (index: number, patch: Partial<(typeof templateForm.intervals)[0]>) => {
+    const updated = [...templateForm.intervals];
+    const item = updated[index];
+    if (item) {
+      const merged = { ...item, ...patch };
+      if (patch.endLocalTime && patch.endDayOffset === undefined) {
+        if (merged.endLocalTime < merged.startLocalTime) {
+          merged.endDayOffset = 1;
+        } else {
+          merged.endDayOffset = 0;
+        }
+      }
+      updated[index] = merged;
+      setTemplateForm({ ...templateForm, intervals: updated });
+    }
+  };
+
   return (
     <div>
       <div style={{ marginBottom: '1.75rem' }}>
@@ -195,7 +287,7 @@ export const SettingsPage: React.FC = () => {
           onClick={() => setActiveTab('DEDUCTIONS')}
         >
           <Layers size={16} />
-          <span>Deduction Types ({deductions.length})</span>
+          <span>Other Deduction Types ({deductions.length})</span>
         </button>
         <button
           className={`btn ${activeTab === 'TEMPLATES' ? 'btn-primary' : 'btn-secondary'}`}
@@ -216,12 +308,35 @@ export const SettingsPage: React.FC = () => {
       {/* Tab 1: Policies */}
       {activeTab === 'POLICY' && (
         <div>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
-            <h2 style={{ fontSize: '1.125rem', fontWeight: 600 }}>Append-Only Policy Version History</h2>
-            <button className="btn btn-primary btn-sm" onClick={() => { setModalError(null); setModalType('POLICY'); }}>
-              <Plus size={14} />
-              <span>Enact New Policy Version</span>
-            </button>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem', flexWrap: 'wrap', gap: '0.5rem' }}>
+            <div>
+              <h2 style={{ fontSize: '1.125rem', fontWeight: 600 }}>Append-Only Policy Version History</h2>
+              <p style={{ fontSize: '0.8125rem', color: 'var(--text-muted)' }}>
+                Governs overtime rates, working days, late grace, and operational benchmarks.
+              </p>
+            </div>
+            <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+              <button
+                className="btn btn-secondary btn-sm"
+                onClick={() => {
+                  setModalError(null);
+                  setModalType('TEMPLATE');
+                }}
+              >
+                <Clock size={14} />
+                <span>Add Shift Template</span>
+              </button>
+              <button
+                className="btn btn-primary btn-sm"
+                onClick={() => {
+                  setModalError(null);
+                  setModalType('POLICY');
+                }}
+              >
+                <Plus size={14} />
+                <span>Enact New Policy Version</span>
+              </button>
+            </div>
           </div>
 
           <div className="card" style={{ padding: 0 }}>
@@ -259,6 +374,53 @@ export const SettingsPage: React.FC = () => {
                 </tbody>
               </table>
             </div>
+          </div>
+
+          {/* Associated Shift Templates under Policy */}
+          <div style={{ marginTop: '2rem' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.85rem' }}>
+              <div>
+                <h3 style={{ fontSize: '1.05rem', fontWeight: 600 }}>Associated Shift Templates</h3>
+                <p style={{ fontSize: '0.8125rem', color: 'var(--text-muted)' }}>
+                  Standard working hour templates operating under restaurant policy for staff scheduling and attendance.
+                </p>
+              </div>
+              <button
+                className="btn btn-primary btn-sm"
+                onClick={() => {
+                  setModalError(null);
+                  setModalType('TEMPLATE');
+                }}
+              >
+                <Plus size={14} />
+                <span>Add Shift Template</span>
+              </button>
+            </div>
+
+            {templates.length === 0 ? (
+              <div className="card" style={{ textAlign: 'center', padding: '1.75rem', color: 'var(--text-muted)' }}>
+                No shift templates configured yet. Click "Add Shift Template" to create one.
+              </div>
+            ) : (
+              <div className="grid-3">
+                {templates.map((tmpl) => (
+                  <div key={tmpl.id} className="card" style={{ padding: '1rem' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem' }}>
+                      <strong style={{ fontSize: '0.925rem' }}>{tmpl.name}</strong>
+                      <span className="badge badge-info">{tmpl.intervals?.length || 1} Interval(s)</span>
+                    </div>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
+                      {tmpl.intervals?.map((inv: any, i: number) => (
+                        <div key={i} className="mono" style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
+                          Interval #{inv.sequenceNumber}: {inv.startLocalTime?.slice(0, 5)} - {inv.endLocalTime?.slice(0, 5)}
+                          {inv.endDayOffset > 0 && ' (+1d)'}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -301,15 +463,46 @@ export const SettingsPage: React.FC = () => {
         </div>
       )}
 
-      {/* Tab 3: Deduction Types */}
+      {/* Tab 3: Other Deduction Types */}
       {activeTab === 'DEDUCTIONS' && (
         <div>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
-            <h2 style={{ fontSize: '1.125rem', fontWeight: 600 }}>Custom Deduction Types</h2>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem', flexWrap: 'wrap', gap: '0.75rem' }}>
+            <div>
+              <h2 style={{ fontSize: '1.125rem', fontWeight: 600 }}>Other Deduction Types (Manual Adjustments)</h2>
+              <p style={{ fontSize: '0.8125rem', color: 'var(--text-muted)' }}>
+                Named operational deduction templates for discretionary adjustments (such as cash register shortages, broken equipment, or uniform fees).
+              </p>
+            </div>
             <button className="btn btn-primary btn-sm" onClick={() => { setModalError(null); setModalType('DEDUCTION'); }}>
               <Plus size={14} />
-              <span>Add Deduction Type</span>
+              <span>Add Other Deduction Type</span>
             </button>
+          </div>
+
+          {/* Architectural Distinction Alert */}
+          <div
+            style={{
+              display: 'flex',
+              gap: '0.875rem',
+              padding: '1rem 1.25rem',
+              backgroundColor: 'var(--surface-muted)',
+              border: '1px solid var(--border)',
+              borderRadius: 'var(--radius-md)',
+              marginBottom: '1.25rem',
+              fontSize: '0.85rem',
+              lineHeight: 1.55,
+            }}
+          >
+            <Shield size={22} style={{ color: 'var(--primary)', flexShrink: 0, marginTop: '0.125rem' }} />
+            <div>
+              <div style={{ fontWeight: 600, color: 'var(--text-main)', marginBottom: '0.25rem' }}>
+                Architectural Distinction: Late Penalties vs. Other Deduction Types
+              </div>
+              <div style={{ color: 'var(--text-muted)' }}>
+                • <strong>Automatic Late Penalties (Policy-driven)</strong>: Defined in your <strong>Operational Policy</strong> ({policies[0]?.lateGraceMinutes ?? 10}m grace period, {policies[0]?.lateDeductionPercentage ?? 10}% daily salary). The attendance calculation engine evaluates late check-ins and applies the penalty automatically (capped at 1 per workday).<br />
+                • <strong>Other Deduction Types (Manual Ledger Adjustments)</strong>: Configured below as templates for non-attendance operational incidents (e.g. till shortages, equipment breakage, uniform fees). They require an explicit business reason and are applied manually on the <strong>Adjustments</strong> page. They never trigger automatically.
+              </div>
+            </div>
           </div>
 
           <div className="card" style={{ padding: 0 }}>
@@ -324,20 +517,28 @@ export const SettingsPage: React.FC = () => {
                   </tr>
                 </thead>
                 <tbody>
-                  {deductions.map((d) => (
-                    <tr key={d.id}>
-                      <td style={{ fontWeight: 600 }}>{d.name}</td>
-                      <td><span className="badge badge-neutral">{d.calculationMethod}</span></td>
-                      <td className="tabular-nums mono">
-                        {d.calculationMethod === 'FIXED' ? `${restaurant?.currencyCode} ${d.defaultValue}` : `${d.defaultValue}%`}
-                      </td>
-                      <td>
-                        <span className={`badge ${d.status === 'ACTIVE' ? 'badge-success' : 'badge-danger'}`}>
-                          {d.status}
-                        </span>
+                  {deductions.length === 0 ? (
+                    <tr>
+                      <td colSpan={4} style={{ textAlign: 'center', padding: '2rem', color: 'var(--text-muted)' }}>
+                        No other deduction types configured. Click "Add Other Deduction Type" to configure operational presets (e.g. Register Shortfall, Equipment Breakage).
                       </td>
                     </tr>
-                  ))}
+                  ) : (
+                    deductions.map((d) => (
+                      <tr key={d.id}>
+                        <td style={{ fontWeight: 600 }}>{d.name}</td>
+                        <td><span className="badge badge-neutral">{d.calculationMethod}</span></td>
+                        <td className="tabular-nums mono">
+                          {d.calculationMethod === 'FIXED' ? `${restaurant?.currencyCode} ${d.defaultValue}` : `${d.defaultValue}%`}
+                        </td>
+                        <td>
+                          <span className={`badge ${d.status === 'ACTIVE' ? 'badge-success' : 'badge-danger'}`}>
+                            {d.status}
+                          </span>
+                        </td>
+                      </tr>
+                    ))
+                  )}
                 </tbody>
               </table>
             </div>
@@ -348,31 +549,52 @@ export const SettingsPage: React.FC = () => {
       {/* Tab 4: Shift Templates */}
       {activeTab === 'TEMPLATES' && (
         <div>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
-            <h2 style={{ fontSize: '1.125rem', fontWeight: 600 }}>Configured Shift Templates</h2>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem', flexWrap: 'wrap', gap: '0.5rem' }}>
+            <div>
+              <h2 style={{ fontSize: '1.125rem', fontWeight: 600 }}>Configured Shift Templates</h2>
+              <p style={{ fontSize: '0.8125rem', color: 'var(--text-muted)' }}>
+                Operational shift definitions available for scheduling staff across work weeks.
+              </p>
+            </div>
+            <button
+              className="btn btn-primary btn-sm"
+              onClick={() => {
+                setModalError(null);
+                setModalType('TEMPLATE');
+              }}
+            >
+              <Plus size={14} />
+              <span>Add Shift Template</span>
+            </button>
           </div>
 
-          <div className="grid-2">
-            {templates.map((tmpl) => (
-              <div key={tmpl.id} className="card">
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.75rem' }}>
-                  <h3 style={{ fontSize: '1rem', fontWeight: 700 }}>{tmpl.name}</h3>
-                  <span className="badge badge-info">{tmpl.intervals?.length || 1} Interval(s)</span>
+          {templates.length === 0 ? (
+            <div className="card" style={{ textAlign: 'center', padding: '2rem', color: 'var(--text-muted)' }}>
+              No shift templates configured yet. Click "Add Shift Template" to create one.
+            </div>
+          ) : (
+            <div className="grid-2">
+              {templates.map((tmpl) => (
+                <div key={tmpl.id} className="card">
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.75rem' }}>
+                    <h3 style={{ fontSize: '1rem', fontWeight: 700 }}>{tmpl.name}</h3>
+                    <span className="badge badge-info">{tmpl.intervals?.length || 1} Interval(s)</span>
+                  </div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem', fontSize: '0.8125rem' }}>
+                    {tmpl.intervals?.map((inv: any, i: number) => (
+                      <div key={i} style={{ display: 'flex', justifyContent: 'space-between', padding: '0.35rem 0', borderBottom: '1px solid var(--border-subtle)' }}>
+                        <span>Interval #{inv.sequenceNumber}:</span>
+                        <strong className="mono">
+                          {inv.startLocalTime?.slice(0, 5)} - {inv.endLocalTime?.slice(0, 5)}
+                          {inv.endDayOffset > 0 && ' (+1d)'}
+                        </strong>
+                      </div>
+                    ))}
+                  </div>
                 </div>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem', fontSize: '0.8125rem' }}>
-                  {tmpl.intervals?.map((inv: any, i: number) => (
-                    <div key={i} style={{ display: 'flex', justifyContent: 'space-between', padding: '0.35rem 0', borderBottom: '1px solid var(--border-subtle)' }}>
-                      <span>Interval #{inv.sequenceNumber}:</span>
-                      <strong className="mono">
-                        {inv.startLocalTime?.slice(0, 5)} - {inv.endLocalTime?.slice(0, 5)}
-                        {inv.endDayOffset > 0 && ' (+1d)'} (Break: {inv.plannedUnpaidBreakMinutes}m)
-                      </strong>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            ))}
-          </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
 
@@ -518,7 +740,7 @@ export const SettingsPage: React.FC = () => {
                     />
                   </div>
                   <div className="form-group">
-                    <label className="form-label">Late Penalty (%)</label>
+                    <label className="form-label">Late Penalty (% of Daily Salary basis)</label>
                     <input
                       type="number"
                       step="1"
@@ -548,6 +770,34 @@ export const SettingsPage: React.FC = () => {
                     value={policyForm.reason}
                     onChange={(e) => setPolicyForm({ ...policyForm, reason: e.target.value })}
                   />
+                </div>
+                <div
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    padding: '0.65rem 0.85rem',
+                    backgroundColor: 'var(--bg-hover)',
+                    borderRadius: 'var(--radius-md)',
+                    border: '1px solid var(--border-light)',
+                    fontSize: '0.8125rem',
+                  }}
+                >
+                  <span style={{ color: 'var(--text-muted)' }}>
+                    Need to configure a new shift template for this policy revision?
+                  </span>
+                  <button
+                    type="button"
+                    className="btn btn-secondary btn-sm"
+                    style={{ padding: '0.25rem 0.6rem', fontSize: '0.75rem' }}
+                    onClick={() => {
+                      setModalError(null);
+                      setModalType('TEMPLATE');
+                    }}
+                  >
+                    <Plus size={12} />
+                    <span>Add Shift Template</span>
+                  </button>
                 </div>
               </div>
               <div className="modal-footer">
@@ -611,8 +861,31 @@ export const SettingsPage: React.FC = () => {
         <div className="modal-backdrop" onClick={() => setModalType(null)}>
           <div className="modal-content" onClick={(e) => e.stopPropagation()}>
             <div className="modal-header">
-              <h2 className="modal-title">Create Deduction Type</h2>
+              <h2 className="modal-title">Create Other Deduction Type (Manual Adjustment)</h2>
             </div>
+
+            {/* Helper Notice */}
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'flex-start',
+                gap: '0.5rem',
+                padding: '0.75rem',
+                backgroundColor: 'var(--surface-muted)',
+                border: '1px solid var(--border)',
+                borderRadius: 'var(--radius-md)',
+                color: 'var(--text-muted)',
+                fontSize: '0.8125rem',
+                marginBottom: '1rem',
+                lineHeight: 1.4,
+              }}
+            >
+              <AlertCircle size={16} style={{ color: 'var(--primary)', flexShrink: 0, marginTop: '0.1rem' }} />
+              <span>
+                <strong>Notice:</strong> Automatic late penalties are governed by your <strong>Operational Policy</strong> and applied directly from attendance records. Manual deduction types are strictly for non-attendance operational losses (e.g. register till shortfalls, damaged equipment, replacement uniforms).
+              </span>
+            </div>
+
             {modalError && (
               <div
                 style={{
@@ -632,15 +905,73 @@ export const SettingsPage: React.FC = () => {
                 <span>{modalError}</span>
               </div>
             )}
-            <form onSubmit={(e) => { e.preventDefault(); createDeductionMutation.mutate(deductionForm); }}>
+
+            {/^(late|lateness|late\s*penalty|late\s*deduction|late\s*arrival)$/i.test(deductionForm.name.trim()) && (
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '0.5rem',
+                  padding: '0.75rem',
+                  backgroundColor: 'var(--status-danger-bg)',
+                  border: '1px solid var(--status-danger-border)',
+                  borderRadius: 'var(--radius-md)',
+                  color: 'var(--status-danger-text)',
+                  fontSize: '0.8125rem',
+                  marginBottom: '1rem',
+                }}
+              >
+                <AlertCircle size={16} />
+                <span>
+                  Lateness deductions are automatically calculated by the attendance engine under Operational Policy. Please do not create a lateness deduction type to prevent duplicate penalties.
+                </span>
+              </div>
+            )}
+
+            {/* Operational Presets */}
+            <div style={{ marginBottom: '1rem' }}>
+              <label className="form-label" style={{ marginBottom: '0.35rem' }}>Quick Operational Presets</label>
+              <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+                {[
+                  { name: 'Register Shortfall', method: 'FIXED' as const, val: 15 },
+                  { name: 'Equipment Breakage', method: 'FIXED' as const, val: 20 },
+                  { name: 'Uniform Replacement', method: 'FIXED' as const, val: 25 },
+                  { name: 'Health Badge Fee', method: 'FIXED' as const, val: 10 },
+                ].map((preset) => (
+                  <button
+                    key={preset.name}
+                    type="button"
+                    className="btn btn-secondary btn-xs"
+                    onClick={() => {
+                      setDeductionForm({
+                        name: preset.name,
+                        calculationMethod: preset.method,
+                        defaultValue: preset.val,
+                      });
+                    }}
+                  >
+                    + {preset.name} ({restaurant?.currencyCode || '$'}{preset.val})
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <form onSubmit={(e) => {
+              e.preventDefault();
+              if (/^(late|lateness|late\s*penalty|late\s*deduction|late\s*arrival)$/i.test(deductionForm.name.trim())) {
+                setModalError('Lateness penalties are automatically governed by Operational Policy. Please do not create a late deduction type.');
+                return;
+              }
+              createDeductionMutation.mutate(deductionForm);
+            }}>
               <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
                 <div className="form-group">
-                  <label className="form-label">Deduction Name</label>
+                  <label className="form-label">Deduction Type Name</label>
                   <input
                     type="text"
                     className="input"
                     required
-                    placeholder="e.g. Broken Crockery, Uniform Replacement"
+                    placeholder="e.g. Register Shortfall, Equipment Breakage"
                     value={deductionForm.name}
                     onChange={(e) => setDeductionForm({ ...deductionForm, name: e.target.value })}
                   />
@@ -653,7 +984,7 @@ export const SettingsPage: React.FC = () => {
                       value={deductionForm.calculationMethod}
                       onChange={(e) => setDeductionForm({ ...deductionForm, calculationMethod: e.target.value as any })}
                     >
-                      <option value="FIXED">Fixed Amount</option>
+                      <option value="FIXED">Fixed Amount ({restaurant?.currencyCode || '$'})</option>
                       <option value="DAILY_PERCENTAGE">Daily Percentage (%)</option>
                     </select>
                   </div>
@@ -672,7 +1003,13 @@ export const SettingsPage: React.FC = () => {
               </div>
               <div className="modal-footer">
                 <button type="button" className="btn btn-secondary" onClick={() => setModalType(null)}>Cancel</button>
-                <button type="submit" className="btn btn-primary" disabled={createDeductionMutation.isPending}>Create Type</button>
+                <button
+                  type="submit"
+                  className="btn btn-primary"
+                  disabled={createDeductionMutation.isPending || /^(late|lateness|late\s*penalty|late\s*deduction|late\s*arrival)$/i.test(deductionForm.name.trim())}
+                >
+                  Create Type
+                </button>
               </div>
             </form>
           </div>
@@ -757,6 +1094,164 @@ export const SettingsPage: React.FC = () => {
               <div className="modal-footer">
                 <button type="button" className="btn btn-secondary" onClick={() => setModalType(null)}>Cancel</button>
                 <button type="submit" className="btn btn-primary" disabled={createAdminMutation.isPending}>Add Administrator</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Add Shift Template Modal */}
+      {modalType === 'TEMPLATE' && (
+        <div className="modal-backdrop" onClick={() => setModalType(null)}>
+          <div className="modal-content" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 540 }}>
+            <div className="modal-header">
+              <div>
+                <h2 className="modal-title">Add Shift Template</h2>
+                <p style={{ fontSize: '0.8125rem', color: 'var(--text-muted)' }}>
+                  Define planned working intervals for scheduling staff under restaurant policy.
+                </p>
+              </div>
+            </div>
+
+            {modalError && (
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '0.5rem',
+                  padding: '0.75rem',
+                  backgroundColor: 'var(--status-danger-bg)',
+                  border: '1px solid var(--status-danger-border)',
+                  borderRadius: 'var(--radius-md)',
+                  color: 'var(--status-danger-text)',
+                  fontSize: '0.8125rem',
+                  marginBottom: '1rem',
+                }}
+              >
+                <AlertCircle size={16} />
+                <span>{modalError}</span>
+              </div>
+            )}
+
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                setModalError(null);
+                createTemplateMutation.mutate(templateForm);
+              }}
+            >
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+                <div className="form-group">
+                  <label className="form-label">Template Name</label>
+                  <input
+                    type="text"
+                    className="input"
+                    required
+                    placeholder="e.g. Morning Shift, Evening Closing, Full Day 9-5"
+                    value={templateForm.name}
+                    onChange={(e) => setTemplateForm({ ...templateForm, name: e.target.value })}
+                  />
+                </div>
+
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '0.25rem' }}>
+                  <label className="form-label" style={{ margin: 0 }}>Working Interval(s)</label>
+                  <span className="badge badge-info" style={{ fontSize: '0.75rem' }}>
+                    Total: {Math.floor(totalTemplateMinutes / 60)}h {totalTemplateMinutes % 60}m ({totalTemplateMinutes} mins)
+                  </span>
+                </div>
+
+                {templateForm.intervals.map((inv, idx) => {
+                  const dur = calculateIntervalMinutes(inv);
+                  return (
+                    <div
+                      key={idx}
+                      style={{
+                        padding: '0.85rem',
+                        backgroundColor: 'var(--bg-hover)',
+                        borderRadius: 'var(--radius-md)',
+                        border: '1px solid var(--border-light)',
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: '0.75rem',
+                      }}
+                    >
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                        <span style={{ fontSize: '0.8125rem', fontWeight: 650 }}>
+                          Interval #{inv.sequenceNumber}
+                        </span>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                          <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
+                            {Math.floor(dur / 60)}h {dur % 60}m
+                          </span>
+                          {templateForm.intervals.length > 1 && (
+                            <button
+                              type="button"
+                              onClick={() => handleRemoveInterval(idx)}
+                              className="btn btn-secondary btn-sm"
+                              style={{ padding: '0.2rem 0.4rem', color: 'var(--status-danger)' }}
+                              title="Remove Interval"
+                            >
+                              <Trash2 size={13} />
+                            </button>
+                          )}
+                        </div>
+                      </div>
+
+                      <div className="grid-2">
+                        <div className="form-group">
+                          <label className="form-label" style={{ fontSize: '0.75rem' }}>Start Time</label>
+                          <input
+                            type="time"
+                            className="input mono"
+                            required
+                            value={inv.startLocalTime}
+                            onChange={(e) => handleUpdateInterval(idx, { startLocalTime: e.target.value })}
+                          />
+                        </div>
+                        <div className="form-group">
+                          <label className="form-label" style={{ fontSize: '0.75rem' }}>End Time</label>
+                          <input
+                            type="time"
+                            className="input mono"
+                            required
+                            value={inv.endLocalTime}
+                            onChange={(e) => handleUpdateInterval(idx, { endLocalTime: e.target.value })}
+                          />
+                        </div>
+                      </div>
+
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                        <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.75rem', cursor: 'pointer' }}>
+                          <input
+                            type="checkbox"
+                            checked={inv.endDayOffset === 1}
+                            onChange={(e) => handleUpdateInterval(idx, { endDayOffset: e.target.checked ? 1 : 0 })}
+                          />
+                          <span>Ends on next day (Overnight shift)</span>
+                        </label>
+                      </div>
+                    </div>
+                  );
+                })}
+
+                <button
+                  type="button"
+                  className="btn btn-secondary btn-sm"
+                  style={{ alignSelf: 'flex-start' }}
+                  onClick={handleAddInterval}
+                >
+                  <Plus size={14} />
+                  <span>Add Split Interval</span>
+                </button>
+              </div>
+
+              <div className="modal-footer" style={{ marginTop: '1.25rem' }}>
+                <button type="button" className="btn btn-secondary" onClick={() => setModalType(null)}>
+                  Cancel
+                </button>
+                <button type="submit" className="btn btn-primary" disabled={createTemplateMutation.isPending}>
+                  {createTemplateMutation.isPending ? 'Creating Template...' : 'Save Shift Template'}
+                </button>
               </div>
             </form>
           </div>

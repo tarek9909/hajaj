@@ -18,10 +18,10 @@ export const monthSchema = z
   .string()
   .refine((v) => /^\d{4}-(0[1-9]|1[0-2])$/.test(v), { message: 'Month must be in YYYY-MM format' });
 
-/** Month query value: accepts YYYY-MM or YYYY-MM-01 and normalizes to YYYY-MM. */
+/** Month query value: accepts YYYY-MM or YYYY-MM-DD and normalizes to YYYY-MM. */
 export const monthQuerySchema = z
   .string()
-  .regex(/^\d{4}-\d{2}(-01)?$/, 'Month must be in YYYY-MM format')
+  .regex(/^\d{4}-\d{2}(-\d{2})?$/, 'Month must be in YYYY-MM format')
   .transform((v) => v.slice(0, 7))
   .pipe(monthSchema);
 
@@ -259,6 +259,21 @@ export const bulkScheduleSchema = z.object({
   existingEntryPolicy: z.enum(['REJECT_CONFLICTS', 'OVERWRITE']).default('OVERWRITE'),
 });
 
+export const batchScheduleSchema = z.object({
+  assignments: z
+    .array(
+      z.object({
+        employeeId: z.string(),
+        workDate: dateString,
+        dayType: z.enum(['WORK', 'OFF', 'CLEAR']),
+        shiftTemplateId: z.string().optional().nullable(),
+      })
+    )
+    .min(1)
+    .max(500),
+  existingEntryPolicy: z.enum(['REJECT_CONFLICTS', 'OVERWRITE']).default('OVERWRITE'),
+});
+
 export const updateScheduleDaySchema = z.object({
   dayType: z.enum(['WORK', 'OFF', 'EXCUSED']),
   shiftTemplateId: z.string().optional().nullable(),
@@ -278,7 +293,7 @@ export const updateScheduleDaySchema = z.object({
 
 export const updateAttendanceDaySchema = z.object({
   status: z.enum(['NOT_RECORDED', 'IN_PROGRESS', 'COMPLETED', 'CONFIRMED_ABSENT', 'EXCUSED', 'NEEDS_REVIEW']),
-  additionalWorkApproved: z.boolean().default(false),
+  additionalWorkApproved: z.boolean().default(true),
   notes: z.string().optional().nullable(),
   expectedVersion: z.number().int().positive(),
   intervals: z.array(

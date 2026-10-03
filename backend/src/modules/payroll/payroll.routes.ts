@@ -10,11 +10,12 @@ import { recordAuditEvent } from '../../infrastructure/logging/audit.js';
 export const payrollRouter = Router({ mergeParams: true });
 
 function parseMonth(value: unknown): string {
-  const month = String(value);
-  if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(month)) {
+  const str = String(value || '');
+  const m = /^(\d{4})-(0[1-9]|1[0-2])(?:-(?:0[1-9]|[12]\d|3[01]))?$/.exec(str);
+  if (!m) {
     throw new AppError(422, 'VALIDATION_ERROR', 'month must be in YYYY-MM format');
   }
-  return month;
+  return `${m[1]}-${m[2]}`;
 }
 
 const money = (v: unknown): number | null => (v === null || v === undefined ? null : Number(v));

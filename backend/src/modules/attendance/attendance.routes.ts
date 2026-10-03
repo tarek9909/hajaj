@@ -22,7 +22,7 @@ const SQL_DT = 'yyyy-MM-dd HH:mm:ss.000';
  */
 const saveAttendanceSchema = z.object({
   status: z.enum(['NOT_RECORDED', 'IN_PROGRESS', 'COMPLETED', 'CONFIRMED_ABSENT', 'EXCUSED', 'NEEDS_REVIEW']),
-  additionalWorkApproved: z.boolean().default(false),
+  additionalWorkApproved: z.boolean().default(true),
   notes: z.string().max(5000).optional().nullable(),
   expectedVersion: z.number().int().min(0).optional(),
   intervals: z
@@ -64,17 +64,17 @@ const getDaily = async (req: Request, res: Response, next: NextFunction) => {
     const [rows] = await pool.execute<RowDataPacket[]>(
       `SELECT
         a.id AS attendance_day_id,
-        d.employee_id,
+        e.id AS employee_id,
         e.full_name,
         e.employee_number,
         p.name AS position_name,
         d.id AS schedule_day_id,
-        d.day_type,
-        d.required_minutes,
+        COALESCE(d.day_type, 'WORK') AS day_type,
+        COALESCE(d.required_minutes, 480) AS required_minutes,
         t.name AS template_name,
-        DATE_FORMAT(d.work_date, '%Y-%m-%d') AS work_date,
+        COALESCE(DATE_FORMAT(d.work_date, '%Y-%m-%d'), ?) AS work_date,
         COALESCE(a.status, 'NOT_RECORDED') AS status,
-        COALESCE(a.additional_work_approved, 0) AS additional_work_approved,
+        COALESCE(a.additional_work_approved, 1) AS additional_work_approved,
         a.notes,
         COALESCE(a.row_version, 0) AS row_version,
         w.id AS automatic_warning_id,
@@ -82,16 +82,16 @@ const getDaily = async (req: Request, res: Response, next: NextFunction) => {
         w.admin_voided AS warning_admin_voided,
         lp.qualifies AS penalty_qualifies,
         lp.calculated_amount AS penalty_amount
-       FROM schedule_days d
-       JOIN employees e ON e.restaurant_id = d.restaurant_id AND e.id = d.employee_id
+       FROM employees e
        JOIN positions p ON p.restaurant_id = e.restaurant_id AND p.id = e.position_id
-       LEFT JOIN attendance_days a ON a.restaurant_id = d.restaurant_id AND a.schedule_day_id = d.id
-       LEFT JOIN shift_templates t ON t.restaurant_id = d.restaurant_id AND t.id = d.source_template_id
-       LEFT JOIN warnings w ON w.restaurant_id = d.restaurant_id AND w.automatic_attendance_day_id = a.id
-       LEFT JOIN late_penalties lp ON lp.restaurant_id = d.restaurant_id AND lp.attendance_day_id = a.id
-       WHERE d.restaurant_id = ? AND d.work_date = ?
+       LEFT JOIN schedule_days d ON d.restaurant_id = e.restaurant_id AND d.employee_id = e.id AND d.work_date = ?
+       LEFT JOIN attendance_days a ON a.restaurant_id = e.restaurant_id AND (a.schedule_day_id = d.id OR (a.employee_id = e.id AND a.work_date = ?))
+       LEFT JOIN shift_templates t ON t.restaurant_id = e.restaurant_id AND t.id = d.source_template_id
+       LEFT JOIN warnings w ON w.restaurant_id = e.restaurant_id AND w.automatic_attendance_day_id = a.id
+       LEFT JOIN late_penalties lp ON lp.restaurant_id = e.restaurant_id AND lp.attendance_day_id = a.id
+       WHERE e.restaurant_id = ? AND (e.status = 'ACTIVE' OR d.id IS NOT NULL)
        ORDER BY e.full_name ASC`,
-      [restaurantId, date]
+      [date, date, date, restaurantId]
     );
 
     const [plannedIntervals] = await pool.execute<RowDataPacket[]>(
@@ -119,7 +119,9 @@ const getDaily = async (req: Request, res: Response, next: NextFunction) => {
     );
 
     const data = rows.map((r) => {
-      const pl = plannedIntervals.filter((i) => String(i.schedule_day_id) === String(r.schedule_day_id));
+      const pl = r.schedule_day_id
+        ? plannedIntervals.filter((i) => String(i.schedule_day_id) === String(r.schedule_day_id))
+        : [];
       const act = r.attendance_day_id
         ? actualIntervals.filter((i) => String(i.attendance_day_id) === String(r.attendance_day_id))
         : [];
@@ -171,9 +173,9 @@ const getDaily = async (req: Request, res: Response, next: NextFunction) => {
         fullName: r.full_name,
         employeeName: r.full_name,
         positionName: r.position_name,
-        scheduleDayId: String(r.schedule_day_id),
+        scheduleDayId: r.schedule_day_id ? String(r.schedule_day_id) : null,
         dayType: r.day_type,
-        templateName: r.template_name,
+        templateName: r.template_name || (r.schedule_day_id ? 'Custom Shift' : 'Standard Shift'),
         requiredMinutes,
         workDate: r.work_date,
         status: r.status,
@@ -274,33 +276,87 @@ function parseAndValidateIntervals(
 
 async function saveAttendance(
   req: Request,
-  target: { attendanceDayId: string } | { scheduleDayId: string }
+  target: { attendanceDayId: string } | { scheduleDayId: string } | { employeeId: string; workDate: string }
 ): Promise<{ attendanceDayId: string; rowVersion: number }> {
   const restaurantId = req.tenantContext!.restaurantId;
   const actorId = req.tenantContext!.actorId;
   const body = saveAttendanceSchema.parse(req.body);
 
   return withTransaction(async (conn: PoolConnection) => {
-    // 1. Lock the schedule day (and period) and resolve / lazily create the attendance day
-    const baseSelect = `SELECT d.id AS schedule_day_id, d.employee_id, d.day_type,
-              DATE_FORMAT(d.work_date, '%Y-%m-%d') AS work_date,
-              DATE_FORMAT(d.payroll_month, '%Y-%m-%d') AS payroll_month,
-              d.required_minutes, p.status AS period_status
-       FROM schedule_days d
-       JOIN payroll_periods p ON p.restaurant_id = d.restaurant_id AND p.month_start = d.payroll_month`;
-
     let scheduleDayId: string;
     if ('scheduleDayId' in target) {
       scheduleDayId = target.scheduleDayId;
-    } else {
+    } else if ('attendanceDayId' in target) {
       const [ref] = await conn.execute<RowDataPacket[]>(
         `SELECT schedule_day_id FROM attendance_days WHERE restaurant_id = ? AND id = ?`,
         [restaurantId, target.attendanceDayId]
       );
       if (!ref[0]) throw new AppError(404, 'ATTENDANCE_NOT_FOUND', 'Attendance day record not found');
       scheduleDayId = String(ref[0].schedule_day_id);
+    } else {
+      // Find or create schedule_day for target.employeeId and target.workDate
+      const [existing] = await conn.execute<RowDataPacket[]>(
+        `SELECT id FROM schedule_days WHERE restaurant_id = ? AND employee_id = ? AND work_date = ?`,
+        [restaurantId, target.employeeId, target.workDate]
+      );
+      if (existing[0]) {
+        scheduleDayId = String(existing[0].id);
+      } else {
+        const [empRows] = await conn.execute<RowDataPacket[]>(
+          `SELECT id, position_id FROM employees WHERE restaurant_id = ? AND id = ?`,
+          [restaurantId, target.employeeId]
+        );
+        if (!empRows[0]) throw new AppError(404, 'EMPLOYEE_NOT_FOUND', 'Employee not found');
+
+        const payrollMonth = `${target.workDate.slice(0, 7)}-01`;
+        await conn.execute(
+          `INSERT INTO payroll_periods (restaurant_id, month_start, status, source_revision)
+           VALUES (?, ?, 'DRAFT', 1)
+           ON DUPLICATE KEY UPDATE id = id`,
+          [restaurantId, payrollMonth]
+        );
+
+        const [periodRows] = await conn.execute<RowDataPacket[]>(
+          `SELECT status FROM payroll_periods WHERE restaurant_id = ? AND month_start = ?`,
+          [restaurantId, payrollMonth]
+        );
+        if (periodRows[0]?.status === 'FINALIZED') {
+          throw new AppError(409, 'PAYROLL_PERIOD_FINALIZED', 'Cannot modify attendance in a finalized month. Please reopen the period first.');
+        }
+
+        const [polRows] = await conn.execute<RowDataPacket[]>(
+          `SELECT id FROM restaurant_policy_versions
+           WHERE restaurant_id = ? AND effective_from_month <= ?
+           ORDER BY effective_from_month DESC, revision_no DESC LIMIT 1`,
+          [restaurantId, payrollMonth]
+        );
+        const policyId = polRows[0]?.id;
+        if (!policyId) throw new AppError(422, 'NO_POLICY_CONFIGURED', 'No effective policy found for this month');
+
+        const [restRows] = await conn.execute<RowDataPacket[]>(
+          `SELECT timezone FROM restaurants WHERE id = ?`,
+          [restaurantId]
+        );
+        const tz = restRows[0]?.timezone || 'UTC';
+
+        const [insDay] = await conn.execute<ResultSetHeader>(
+          `INSERT INTO schedule_days
+            (restaurant_id, employee_id, work_date, payroll_month, day_type, source_template_id, policy_version_id, required_minutes, timezone_snapshot, created_by, updated_by)
+           VALUES (?, ?, ?, ?, 'WORK', NULL, ?, 480, ?, ?, ?)`,
+          [restaurantId, target.employeeId, target.workDate, payrollMonth, policyId, tz, actorId, actorId]
+        );
+        scheduleDayId = String(insDay.insertId);
+      }
     }
     if (!/^\d+$/.test(scheduleDayId)) throw new AppError(404, 'SCHEDULE_DAY_NOT_FOUND', 'Schedule day not found');
+
+    // 1. Lock the schedule day (and period) and resolve / lazily create the attendance day
+    const baseSelect = `SELECT d.id AS schedule_day_id, d.employee_id, d.day_type,
+              DATE_FORMAT(d.work_date, '%Y-%m-%d') AS work_date,
+              DATE_FORMAT(d.payroll_month, '%Y-%m-%d') AS payroll_month,
+              d.required_minutes, COALESCE(p.status, 'DRAFT') AS period_status
+       FROM schedule_days d
+       LEFT JOIN payroll_periods p ON p.restaurant_id = d.restaurant_id AND p.month_start = d.payroll_month`;
 
     const [dayRows] = await conn.execute<RowDataPacket[]>(
       `${baseSelect} WHERE d.restaurant_id = ? AND d.id = ? FOR UPDATE`,
@@ -309,7 +365,7 @@ async function saveAttendance(
     const day = dayRows[0];
     if (!day) throw new AppError(404, 'SCHEDULE_DAY_NOT_FOUND', 'Schedule day not found');
     if (day.period_status === 'FINALIZED') {
-      throw new AppError(409, 'PAYROLL_PERIOD_FINALIZED', 'Cannot modify attendance in a finalized month');
+      throw new AppError(409, 'PAYROLL_PERIOD_FINALIZED', 'Cannot modify attendance in a finalized month. Please reopen the period first.');
     }
 
     const [attRows] = await conn.execute<RowDataPacket[]>(
@@ -609,3 +665,23 @@ attendanceRouter.put('/days/:attendanceDayId', async (req: Request, res: Respons
     next(err);
   }
 });
+
+// PUT /api/v1/restaurants/:restaurantId/attendance/days/by-employee/:employeeId
+// Allows recording/editing attendance directly for an employee on any given work date
+attendanceRouter.put('/days/by-employee/:employeeId', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const employeeId = String(req.params.employeeId);
+    const workDate = String(req.query.workDate || req.body.workDate);
+    if (!ISO_DATE_RE.test(workDate) || !DateTime.fromISO(workDate).isValid) {
+      throw new AppError(422, 'INVALID_DATE', 'workDate must be a valid YYYY-MM-DD date');
+    }
+    const result = await saveAttendance(req, { employeeId, workDate });
+    res.json({
+      data: { message: 'Attendance saved and evaluated successfully', ...result },
+      meta: { requestId: req.requestId },
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+

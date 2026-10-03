@@ -354,6 +354,18 @@ function toBulkPayload(f: BulkScheduleForm) {
   };
 }
 
+export interface BatchScheduleAssignment {
+  employeeId: string;
+  workDate: string;
+  dayType: 'WORK' | 'OFF' | 'CLEAR';
+  shiftTemplateId?: string | null;
+}
+
+export interface BatchScheduleForm {
+  assignments: BatchScheduleAssignment[];
+  existingEntryPolicy?: 'REJECT_CONFLICTS' | 'OVERWRITE';
+}
+
 export const schedulingApi = {
   getCalendar: (restaurantId: string, month: string) =>
     apiRequest<Array<{
@@ -372,6 +384,23 @@ export const schedulingApi = {
       }>;
     }>>(`/api/v1/restaurants/${restaurantId}/schedules?month=${month}`),
 
+  getCalendarRange: (restaurantId: string, from: string, to: string) =>
+    apiRequest<Array<{
+      id: string;
+      employeeId: string;
+      workDate: string;
+      dayType: 'WORK' | 'OFF' | 'EXCUSED';
+      sourceTemplateId: string | null;
+      templateName: string | null;
+      requiredMinutes: number;
+      intervals: Array<{
+        sequenceNumber: number;
+        plannedStartAt: string;
+        plannedEndAt: string;
+        plannedUnpaidBreakMinutes: number;
+      }>;
+    }>>(`/api/v1/restaurants/${restaurantId}/schedules?from=${from}&to=${to}`),
+
   previewBulk: (restaurantId: string, data: BulkScheduleForm) =>
     apiRequest<{ totalDaysToGenerate: number; conflictCount: number; warnings: string[] }>(
       `/api/v1/restaurants/${restaurantId}/schedules/bulk-preview`,
@@ -383,6 +412,12 @@ export const schedulingApi = {
       `/api/v1/restaurants/${restaurantId}/schedules/bulk-commit`,
       { method: 'POST', body: JSON.stringify(toBulkPayload(data)) }
     ),
+
+  batchSchedule: (restaurantId: string, data: BatchScheduleForm) =>
+    apiRequest<{ scheduledCount: number; message: string }>(
+      `/api/v1/restaurants/${restaurantId}/schedules/batch`,
+      { method: 'POST', body: JSON.stringify(data) }
+    ),
 };
 
 // ==========================================
@@ -391,13 +426,16 @@ export const schedulingApi = {
 export const attendanceApi = {
   getDaily: (restaurantId: string, date: string) =>
     apiRequest<Array<{
-      attendanceDayId: string;
+      attendanceDayId: string | null;
       employeeId: string;
       employeeNumber: string;
       fullName: string;
-      scheduleDayId: string;
+      positionName?: string | null;
+      scheduleDayId: string | null;
       dayType: string;
+      templateName?: string | null;
       requiredMinutes: number;
+      workDate: string;
       status: 'NOT_RECORDED' | 'IN_PROGRESS' | 'COMPLETED' | 'CONFIRMED_ABSENT' | 'EXCUSED' | 'NEEDS_REVIEW';
       additionalWorkApproved: boolean;
       notes: string | null;
@@ -450,6 +488,9 @@ export const warningsApi = {
       method: 'POST',
       body: JSON.stringify(data),
     }),
+
+  getExportUrl: (restaurantId: string, month: string) =>
+    `/api/v1/restaurants/${restaurantId}/reports/warnings?month=${month}&format=xlsx`,
 };
 
 // ==========================================
@@ -603,6 +644,64 @@ export const payrollApi = {
 
   getExportUrl: (restaurantId: string, month: string) =>
     `/api/v1/restaurants/${restaurantId}/reports/monthly?month=${month}&format=xlsx`,
+};
+
+// ==========================================
+// REPORTS API
+// ==========================================
+export const reportsApi = {
+  getMonthly: (restaurantId: string, month: string) =>
+    apiRequest<any>(`/api/v1/restaurants/${restaurantId}/reports/monthly?month=${month}`),
+
+  getWarningsReport: (restaurantId: string, month: string) =>
+    apiRequest<{
+      month: string;
+      threshold: number;
+      overview: {
+        totalWarnings: number;
+        activeWarnings: number;
+        voidedWarnings: number;
+        countedWarnings: number;
+        automaticCount: number;
+        customCount: number;
+        employeesAtLimit: number;
+      };
+      summary: Array<{
+        employeeId: string;
+        fullName: string;
+        employeeNumber: string;
+        positionName: string;
+        automaticWarningCount: number;
+        customWarningCount: number;
+        validWarningCount: number;
+        countedWarningCount: number;
+        limitReached: boolean;
+      }>;
+      warnings: Array<{
+        id: string;
+        employeeId: string;
+        fullName: string;
+        employeeNumber: string;
+        positionName: string;
+        origin: string;
+        incidentDate: string;
+        title: string;
+        reason: string;
+        lateMinutes: number | null;
+        systemQualifies: boolean;
+        countsTowardLimit: boolean;
+        adminVoided: boolean;
+        status: 'ACTIVE' | 'VOIDED' | 'NON_QUALIFYING';
+        voidReason: string | null;
+        voidedByName: string | null;
+        voidedAt: string | null;
+        createdByName: string | null;
+        createdAt: string;
+      }>;
+    }>(`/api/v1/restaurants/${restaurantId}/reports/warnings?month=${month}`),
+
+  getWarningsExportUrl: (restaurantId: string, month: string) =>
+    `/api/v1/restaurants/${restaurantId}/reports/warnings?month=${month}&format=xlsx`,
 };
 
 // ==========================================

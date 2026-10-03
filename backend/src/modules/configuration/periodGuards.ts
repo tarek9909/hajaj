@@ -3,9 +3,9 @@ import { AppError } from '../../middleware/errorHandler.js';
 
 type Db = PoolConnection | Pool;
 
-/** Accepts YYYY-MM or YYYY-MM-01 and returns YYYY-MM-01; throws 422 otherwise. */
+/** Accepts YYYY-MM, YYYY-MM-01, or any date YYYY-MM-DD and returns YYYY-MM-01; throws 422 otherwise. */
 export function normalizeMonthStart(value: string, field = 'month'): string {
-  const m = /^(\d{4})-(0[1-9]|1[0-2])(?:-01)?$/.exec(value);
+  const m = /^(\d{4})-(0[1-9]|1[0-2])(?:-(?:0[1-9]|[12]\d|3[01]))?$/.exec(value);
   if (!m) {
     throw new AppError(422, 'INVALID_MONTH', `${field} must be in YYYY-MM format`);
   }
